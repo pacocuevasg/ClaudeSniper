@@ -80,8 +80,9 @@ open /Applications/ClaudeSniper.app
 The first time, from the ✨ menu in the menu bar:
 
 1. **Sign in to Claude…** opens Terminal with `claude auth login`.
-2. **Allow keyboard access (⌘⇧2)…**: turn on ClaudeSniper in *System Settings → Privacy & Security → Input Monitoring*. If you changed TextSniper's shortcut, set the same one in **Settings → Change capture shortcut**.
-3. Flip the switch on, pick a model, effort and mode, and try ⌘⇧2.
+2. Flip the switch on, pick a model, effort and mode, and try ⌘⇧2 in TextSniper.
+
+No keyboard permission is needed: ClaudeSniper notices TextSniper's capture overlay when the text is copied.
 
 > [!TIP]
 > To preview the pop-up without using your plan: `open /Applications/ClaudeSniper.app --args --demo`
@@ -89,9 +90,9 @@ The first time, from the ✨ menu in the menu bar:
 ## How it works
 
 ```
-⌘⇧2 ──► event tap (listen-only) ──► "armed" for 30 s
+⌘⇧2 in TextSniper ──► capture overlay on screen
                                          │
-TextSniper copies the text ──► clipboard changes
+TextSniper copies the text ──► clipboard changes while the overlay is up
                                          │
                                          ▼
           claude -p --model … --effort … --session-id / --resume <chat>
@@ -106,8 +107,8 @@ TextSniper copies the text ──► clipboard changes
 
 ## Privacy
 
-- The shortcut is detected with a **listen-only** event tap: it never blocks or changes any key, and it only reacts to ⌘⇧2.
-- Only what TextSniper copies right after ⌘⇧2 is sent to Claude (or what you send with "Interpret clipboard now").
+- No keyboard monitoring is needed: ClaudeSniper only checks whether TextSniper's capture window is on screen when the clipboard changes. (If you do allow *Input Monitoring*, it also listens for your capture shortcut with a listen-only event tap that never blocks or changes keys.)
+- Only what TextSniper copies is sent to Claude (or what you send with "Interpret clipboard now").
 - Conversations are stored where Claude Code keeps its sessions (`~/.claude/projects/`). Temporary image captures are deleted after 24 hours.
 
 ## Customize

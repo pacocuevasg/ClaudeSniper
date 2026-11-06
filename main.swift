@@ -441,11 +441,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             menu.addItem(status(false, loggedIn == nil ? "Checking connection…" : "Sign in to Claude…", action: #selector(login)))
         }
-        if CGPreflightListenEventAccess() {
-            menu.addItem(status(true, "\(hotkeyLabel) shortcut detected", action: nil))
-        } else {
-            menu.addItem(status(false, "Allow keyboard access (\(hotkeyLabel))…", action: #selector(askKeyboardPermission)))
-        }
+        menu.addItem(status(true, "Watching for TextSniper captures", action: nil))
         menu.addItem(.separator())
         menu.addItem(item("Interpret clipboard now", "wand.and.stars", #selector(testNow)))
         menu.addItem(settingsItem())
@@ -734,8 +730,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Monitoring
 
     func startMonitoring() {
-        if !CGPreflightListenEventAccess() { CGRequestListenEventAccess() }
-        installTap()
+        installTap()  // optional: only works if Input Monitoring is allowed
         lastChange = NSPasteboard.general.changeCount
         pollTimer?.invalidate()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in self?.poll() }
@@ -770,9 +765,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let c = NSPasteboard.general.changeCount
         guard c != lastChange else { return }
         lastChange = c
-        if Date() < armedUntil {
+        // Two ways to know the copy came from TextSniper:
+        // 1. its capture overlay is on screen (no permission needed), or
+        // 2. the capture shortcut was just pressed (needs Input Monitoring).
+        if Date() < armedUntil || textSniperIsCapturing() {
             armedUntil = .distantPast
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.handleClipboard() }
+        } else {
+            // The overlay can lag the clipboard by a moment: look once more.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                if self.lastChange == c && self.textSniperIsCapturing() { self.handleClipboard() }
+            }
+        }
+    }
+
+    /// True while TextSniper shows a capture window (anything above normal windows
+    /// that isn't its menu bar icon). Reading window owners needs no permission.
+    func textSniperIsCapturing() -> Bool {
+        let wins = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+        return wins.contains { w in
+            let owner = w[kCGWindowOwnerName as String] as? String ?? ""
+            let layer = w[kCGWindowLayer as String] as? Int ?? 0
+            return owner.hasPrefix("TextSniper") && layer > 0 && layer != 25
         }
     }
 
