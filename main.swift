@@ -101,6 +101,8 @@ enum Settings {
     static var autoClose: Int { defaults.object(forKey: "autoClose") as? Int ?? 0 }
     static var autoCopy: Bool { defaults.bool(forKey: "autoCopy") }
     static var sound: Bool { defaults.bool(forKey: "sound") }
+    /// Answers wait in a tiny Clawd instead of opening the pop-up.
+    static var miniMode: Bool { defaults.bool(forKey: "miniMode") }
 }
 let chatMemoryOptions: [(Any, String)] = [(0, "Off · every capture is a new chat"), (5, "5 minutes"), (10, "10 minutes"),
                                           (15, "15 minutes"), (30, "30 minutes"), (60, "1 hour")]
@@ -519,6 +521,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var testMode: String?
     var pendingFollowUp: String?
     lazy var popup = PopupController()
+    lazy var mini = MiniClawd()
+    var miniThisRequest = false
+    /// What clicking Mini Clawd opens (the answer, or the error).
+    var miniPending: (() -> Void)?
+    var miniLoading: (header: String, preview: String)?
+
+    /// Shows a state in the pop-up, or in Mini Clawd when that mode is on for this request.
+    func display(header: String, preview: String, state: PopupController.State, footer: String) {
+        guard miniThisRequest else { popup.show(header: header, preview: preview, state: state, footer: footer); return }
+        switch state {
+        case .loading, .streaming:
+            miniLoading = (header, preview)
+            mini.show(.thinking)
+        case .result:
+            mini.show(.ready)
+            miniPending = { [weak self] in self?.popup.show(header: header, preview: preview, state: state, footer: footer) }
+        case .error:
+            mini.show(.error)
+            miniPending = { [weak self] in self?.popup.show(header: header, preview: preview, state: state, footer: footer) }
+        }
+    }
+
+    /// Click on Mini Clawd: open the answer (or follow the rest of the answer in the pop-up).
+    func miniClicked() {
+        mini.hide()
+        if let open = miniPending {
+            miniPending = nil
+            open()
+        } else if let l = miniLoading {
+            miniThisRequest = false
+            popup.show(header: l.header, preview: l.preview, state: .loading, footer: "Writing…")
+        }
+    }
     var loggedIn: Bool?
     var account = ""
     let menuWidth: CGFloat = 300
@@ -555,6 +590,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         func value(_ k: String) -> String? { a.firstIndex(of: k).flatMap { $0 + 1 < a.count ? a[$0 + 1] : nil } }
         if let path = value("--export-md-to"), let last = history.entries.last {   // test the Markdown export
             try? chatMarkdown(history.chat(last.chatID)).write(toFile: path, atomically: true, encoding: .utf8)
+        }
+        if a.contains("--demo-mini") {   // Mini Clawd: thinking, then the answer is ready
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.mini.show(.thinking) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.mini.show(.ready) }
+        }
+        if let secs = value("--click-mini-after").flatMap(Double.init) {   // test: click Mini Clawd
+            DispatchQueue.main.asyncAfter(deadline: .now() + secs) { self.miniClicked() }
         }
         if a.contains("--demo-history") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.openHistory() } }
         if a.contains("--interpret-clipboard") {
@@ -882,6 +924,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func showLast() {
         guard let s = lastShown else { NSSound.beep(); return }
+        mini.hide()
+        miniPending = nil
         popup.mode = s.mode
         popup.allowReplace = s.replace
         popup.show(header: s.header, preview: s.preview, state: .result(s.text), footer: s.footer)
@@ -973,6 +1017,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.addItem(.separator())
         m.addItem(toggle("Copy the answer automatically", "doc.on.clipboard", key: "autoCopy"))
         m.addItem(toggle("Play a sound when the answer arrives", "speaker.wave.2", key: "sound"))
+        m.addItem(toggle("Mini Clawd mode: answers wait in a tiny Clawd", "face.smiling", key: "miniMode"))
         if AXIsProcessTrusted() {
             let ap = NSMenuItem(title: "Auto-paste for Replace is on", action: nil, keyEquivalent: "")
             ap.image = NSImage(systemSymbolName: "checkmark.circle", accessibilityDescription: nil)
@@ -1222,6 +1267,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         current?.process.terminate()
         requestID += 1
+        // Mini Clawd: only when the pop-up isn't already open (re-runs and follow-ups stay in it).
+        miniThisRequest = Settings.miniMode && !popup.panel.isVisible
         let myID = requestID
         let hdr = header()
         let modeLabel = mode(popup.mode).label
@@ -1235,7 +1282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let activeAtStart = store.activeID
         let title = preview.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
 
-        popup.show(header: hdr, preview: preview, state: .loading,
+        display(header: hdr, preview: preview, state: .loading,
                    footer: followUp != nil ? "Follow-up · same chat"
                        : existing.map { "Chat · \($0.count) capture\($0.count == 1 ? "" : "s") · continuing" } ?? "Starting a new chat…")
 
@@ -1250,7 +1297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         current = run
         run.onText = { [weak self] t in
             guard let self, myID == self.requestID, !t.isEmpty else { return }
-            self.popup.show(header: hdr, preview: preview, state: .streaming(t), footer: "Writing…")
+            self.display(header: hdr, preview: preview, state: .streaming(t), footer: "Writing…")
         }
         let started = run.start(claude, args, stdin: prompt, timeout: 300) { status, r in
             guard myID == self.requestID else { return }
@@ -1265,7 +1312,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.history.add(HistoryEntry(chatID: sessionID, mode: modeLabel, model: hdr,
                                               capture: captureText, followUp: followUp, answer: text))
                 let footer = self.chatFooter()
-                self.popup.show(header: hdr, preview: preview, state: .result(text), footer: footer)
+                self.display(header: hdr, preview: preview, state: .result(text), footer: footer)
                 self.lastShown = Shown(header: hdr, preview: preview, text: text, mode: self.popup.mode, footer: footer, replace: followUp == nil)
                 if Settings.autoCopy {
                     NSPasteboard.general.clearContents()
@@ -1285,14 +1332,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.ask(prompt: prompt, image: image, preview: preview, followUp: followUp)  // retry in a new chat
             } else if all.contains("authenticate") || all.contains("/login") || all.contains("401") {
                 self.loggedIn = false
-                self.popup.show(header: hdr, preview: preview, state: .error("You're not signed in to Claude Code.\nOpen the menu bar menu → “Sign in to Claude…”."), footer: "")
+                self.display(header: hdr, preview: preview, state: .error("You're not signed in to Claude Code.\nOpen the menu bar menu → “Sign in to Claude…”."), footer: "")
             } else {
                 let msg = !text.isEmpty ? text : !errText.isEmpty ? errText : "Unknown error (code \(status))."
-                self.popup.show(header: hdr, preview: preview, state: .error(msg), footer: self.chatFooter())
+                self.display(header: hdr, preview: preview, state: .error(msg), footer: self.chatFooter())
             }
         }
         if !started {
-            popup.show(header: hdr, preview: preview, state: .error("Couldn't start Claude Code: \(run.other)"), footer: "")
+            display(header: hdr, preview: preview, state: .error("Couldn't start Claude Code: \(run.other)"), footer: "")
         }
     }
 
@@ -1914,6 +1961,138 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
             }
         }
         return out
+    }
+}
+
+// MARK: - Mini Clawd (a tiny floating Clawd instead of the pop-up)
+
+final class MiniView: NSView {
+    weak var owner: MiniClawd?
+    private var downAt = NSPoint.zero
+    private var dragged = false
+    override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true }
+    override func mouseDown(with e: NSEvent) { downAt = e.locationInWindow; dragged = false }
+    override func mouseDragged(with e: NSEvent) {
+        guard let w = window else { return }
+        let dx = e.locationInWindow.x - downAt.x, dy = e.locationInWindow.y - downAt.y
+        if abs(dx) + abs(dy) > 2 { dragged = true }
+        w.setFrameOrigin(NSPoint(x: w.frame.origin.x + dx, y: w.frame.origin.y + dy))
+    }
+    override func mouseUp(with e: NSEvent) { if !dragged { owner?.clicked() } }
+    override func rightMouseUp(with e: NSEvent) { owner?.hide() }
+}
+
+final class MiniClawd: NSObject {
+    enum Phase { case thinking, ready, error }
+
+    let panel: NSPanel
+    let clawd = NSImageView()
+    let shadow = NSView()
+    let bubble = NSView()
+    let bubbleLabel = NSTextField(labelWithString: "")
+    let frames = Pixel.clawdFrames(px: 3)
+    let idle = Pixel.clawd(px: 3)
+    var phase = Phase.thinking
+    var timer: Timer?
+    var since = Date()
+    var tick = 0
+
+    override init() {
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 100, height: 88),
+                        styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        super.init()
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.level = .floating
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        let v = MiniView(frame: NSRect(x: 0, y: 0, width: 100, height: 88))
+        v.owner = self
+        v.toolTip = "Click to see the answer · drag to move · right-click to hide"
+        panel.contentView = v
+
+        shadow.wantsLayer = true
+        shadow.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.28).cgColor
+        shadow.layer?.cornerRadius = 4
+        shadow.frame = NSRect(x: 14, y: 4, width: 40, height: 8)
+
+        clawd.imageScaling = .scaleNone
+        clawd.image = idle
+        clawd.frame = NSRect(x: 8, y: 8, width: 51, height: 36)
+
+        bubble.wantsLayer = true
+        bubble.layer?.cornerRadius = 12
+        bubble.layer?.borderWidth = 2
+        bubble.layer?.borderColor = NSColor.white.withAlphaComponent(0.9).cgColor
+        bubble.frame = NSRect(x: 52, y: 46, width: 40, height: 26)
+        bubbleLabel.font = .systemFont(ofSize: 14, weight: .heavy)
+        bubbleLabel.textColor = .white
+        bubbleLabel.alignment = .center
+        bubbleLabel.frame = NSRect(x: 0, y: 3, width: 40, height: 18)
+        bubble.addSubview(bubbleLabel)
+
+        for x in [shadow, clawd, bubble] as [NSView] { v.addSubview(x) }
+    }
+
+    func show(_ p: Phase) {
+        phase = p
+        since = Date()
+        tick = 0
+        if !panel.isVisible {
+            let m = NSEvent.mouseLocation
+            let vf = (NSScreen.screens.first { NSMouseInRect(m, $0.frame, false) } ?? NSScreen.main!).visibleFrame
+            let x = min(max(m.x + 14, vf.minX + 4), vf.maxX - 104)
+            let y = min(max(m.y - 96, vf.minY + 4), vf.maxY - 92)
+            panel.setFrameOrigin(NSPoint(x: x, y: y))
+            panel.alphaValue = 0
+            panel.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { $0.duration = 0.2; panel.animator().alphaValue = 1 }
+        }
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in self?.step() }
+        step()
+    }
+
+    func hide() {
+        timer?.invalidate(); timer = nil
+        guard panel.isVisible else { return }
+        NSAnimationContext.runAnimationGroup({ $0.duration = 0.15; panel.animator().alphaValue = 0 },
+                                             completionHandler: { self.panel.orderOut(nil); self.panel.alphaValue = 1 })
+    }
+
+    func clicked() { appDelegate?.miniClicked() }
+
+    /// One animation frame: walk while thinking, a happy hop when the answer is ready.
+    func step() {
+        tick += 1
+        let t = Date().timeIntervalSince(since)
+        var lift: CGFloat = 0
+        switch phase {
+        case .thinking:
+            clawd.image = frames[(tick / 2) % 5]
+            bubbleLabel.stringValue = String(repeating: "·", count: 1 + (tick / 4) % 3)
+            bubble.layer?.backgroundColor = NSColor(white: 0.2, alpha: 0.9).cgColor
+        case .ready:
+            // three hops that fade out, then a small hop and a blink every few seconds
+            let cycle = t < 1.6 ? t : (t - 1.6).truncatingRemainder(dividingBy: 3.2)
+            let hop = t < 1.6 ? abs(sin(t * .pi / 0.53)) * CGFloat(1.6 - t) * 12 : (cycle < 0.35 ? abs(sin(cycle * .pi / 0.35)) * 6 : 0)
+            lift = hop
+            clawd.image = (t > 1.6 && cycle > 1.5 && cycle < 1.7) ? frames[5] : idle
+            bubbleLabel.stringValue = "!"
+            let pulse = 0.85 + 0.15 * sin(t * 4)
+            bubble.layer?.backgroundColor = claudeOrange.withAlphaComponent(pulse).cgColor
+        case .error:
+            clawd.image = idle
+            bubbleLabel.stringValue = "?"
+            bubble.layer?.backgroundColor = NSColor.systemRed.withAlphaComponent(0.85).cgColor
+        }
+        clawd.frame.origin.y = 8 + lift
+        bubble.frame.origin.y = 46 + lift
+        let s = 1 - min(lift, 12) / 40
+        shadow.frame = NSRect(x: 14 + (1 - s) * 20, y: 4, width: 40 * s, height: 8)
     }
 }
 

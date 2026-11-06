@@ -48,8 +48,9 @@ A native macOS menu bar app that connects [TextSniper](https://textsniper.app) t
 - **Chat memory:** captures in a row share context (15 minutes by default, adjustable). Start a new chat or switch between recent ones.
 - **History:** every answer is saved and searchable. **Export a chat** to Markdown or Apple Notes.
 - **Show last answer:** ⌥⌘2 brings the pop-up back.
+- **Mini Clawd mode:** instead of the pop-up, a tiny Clawd walks while Claude thinks and hops with a **!** when the answer is ready. Click it to open the answer, drag it anywhere, right-click to hide it (Settings → Mini Clawd mode).
 - **Answer language:** match your Mac, or English, Español, Português, Français or Deutsch.
-- **Settings:** answer length, pop-up position, auto-close, auto-copy, a sound when the answer arrives, a custom capture shortcut, open at login.
+- **Settings:** answer length, pop-up position, auto-close, auto-copy, a sound when the answer arrives, Mini Clawd mode, a custom capture shortcut, open at login.
 - **Images:** if the clipboard holds an image, Claude analyzes it.
 - **Pixel-art Clawd** walks while Claude thinks.
 
@@ -88,7 +89,7 @@ The first time, from the ✨ menu in the menu bar:
 No keyboard permission is needed: ClaudeSniper notices TextSniper's capture overlay when the text is copied.
 
 > [!TIP]
-> To preview the pop-up without using your plan: `open /Applications/ClaudeSniper.app --args --demo`
+> To preview the pop-up without using your plan: `open /Applications/ClaudeSniper.app --args --demo` (or `--demo-mini` for Mini Clawd)
 >
 > To test without TextSniper, copy some text and run `open /Applications/ClaudeSniper.app --args --interpret-clipboard --mode explain`
 
