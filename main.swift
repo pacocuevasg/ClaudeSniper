@@ -1,8 +1,8 @@
-// ClaudeSniper — companion de TextSniper.
-// Icono pixel-art en la barra de menú con toggle on/off. Cuando está activo y usas ⌘⇧2
-// en TextSniper, manda lo capturado a Claude (vía Claude Code, usando tu plan) y muestra
-// la respuesta en un pop-up. Las capturas se agrupan en un chat que expira tras 15 min
-// sin uso; desde el menú o el pop-up puedes empezar un chat nuevo o cambiar a otro.
+// ClaudeSniper — a companion for TextSniper.
+// Pixel-art menu bar icon with an on/off toggle. When it's on and you press ⌘⇧2 in
+// TextSniper, it sends the capture to Claude (through Claude Code, using your plan) and
+// shows the answer in a pop-up. Captures are grouped into a chat that expires after
+// 15 minutes without use; from the menu or the pop-up you can start a new chat or switch.
 
 import Cocoa
 import ServiceManagement
@@ -18,53 +18,71 @@ let eyeColor = NSColor(srgbRed: 0.13, green: 0.09, blue: 0.07, alpha: 1)
 
 struct Opt { let id: String; let label: String; let detail: String }
 let models = [
-    Opt(id: "haiku", label: "Haiku", detail: "el más rápido"),
-    Opt(id: "sonnet", label: "Sonnet", detail: "equilibrado"),
-    Opt(id: "opus", label: "Opus", detail: "muy capaz"),
-    Opt(id: "fable", label: "Fable", detail: "el más capaz"),
+    Opt(id: "haiku", label: "Haiku", detail: "fastest"),
+    Opt(id: "sonnet", label: "Sonnet", detail: "balanced"),
+    Opt(id: "opus", label: "Opus", detail: "very capable"),
+    Opt(id: "fable", label: "Fable", detail: "most capable"),
 ]
 let efforts = [
-    Opt(id: "low", label: "Bajo", detail: ""),
-    Opt(id: "medium", label: "Medio", detail: ""),
-    Opt(id: "high", label: "Alto", detail: ""),
-    Opt(id: "xhigh", label: "Muy alto", detail: ""),
-    Opt(id: "max", label: "Máx", detail: ""),
+    Opt(id: "low", label: "Low", detail: ""),
+    Opt(id: "medium", label: "Medium", detail: ""),
+    Opt(id: "high", label: "High", detail: ""),
+    Opt(id: "xhigh", label: "X-High", detail: ""),
+    Opt(id: "max", label: "Max", detail: ""),
 ]
 func label(_ opts: [Opt], _ id: String) -> String { opts.first { $0.id == id }?.label ?? id }
 
-/// Modos de acción rápida. En el pop-up se cambian con los botones o las teclas 1–6.
+/// Quick action modes. In the pop-up, switch with the buttons or keys 1–6.
 struct Mode { let id: String; let label: String; let symbol: String; let instruction: String }
 let modes = [
     Mode(id: "auto", label: "Auto", symbol: "sparkles",
-         instruction: "Interpreta la captura y da la respuesta más útil según las reglas generales."),
-    Mode(id: "explain", label: "Explicar", symbol: "lightbulb",
-         instruction: "Explica con claridad qué significa, como a un estudiante, con un ejemplo sencillo."),
-    Mode(id: "translate", label: "Traducir", symbol: "character.bubble",
-         instruction: "Tradúcelo: si está en español, al inglés; si está en otro idioma, al español. Da primero solo la traducción y después, si hace falta, 1–3 notas breves sobre matices."),
-    Mode(id: "summarize", label: "Resumir", symbol: "list.bullet",
-         instruction: "Resume lo esencial en 3–5 viñetas cortas."),
-    Mode(id: "solve", label: "Resolver", symbol: "function",
-         instruction: "Resuélvelo paso a paso, numerando los pasos, y termina con la respuesta final en negrita."),
-    Mode(id: "fix", label: "Corregir", symbol: "checkmark.seal",
-         instruction: "Corrige ortografía, gramática y estilo sin cambiar el idioma ni el sentido. Devuelve primero el texto corregido completo y después una lista breve de los cambios."),
+         instruction: "Interpret the capture and give the most useful answer, following the general rules."),
+    Mode(id: "explain", label: "Explain", symbol: "lightbulb",
+         instruction: "Explain clearly what it means, as if to a student, with a simple example."),
+    Mode(id: "translate", label: "Translate", symbol: "character.bubble",
+         instruction: "Translate it into the answer language; if it is already in that language, translate it into English (or into Spanish if the answer language is English). Give only the translation first, then, if useful, 1–3 short notes on nuances."),
+    Mode(id: "summarize", label: "Summarize", symbol: "list.bullet",
+         instruction: "Summarize the essentials in 3–5 short bullet points."),
+    Mode(id: "solve", label: "Solve", symbol: "function",
+         instruction: "Solve it step by step, numbering the steps, and end with the final answer in bold."),
+    Mode(id: "fix", label: "Fix", symbol: "checkmark.seal",
+         instruction: "Fix spelling, grammar and style without changing the language or the meaning. Return the full corrected text first, then a short list of the changes."),
 ]
 func mode(_ id: String) -> Mode { modes.first { $0.id == id } ?? modes[0] }
 
-let systemPrompt = """
-El usuario captura fragmentos de su pantalla con TextSniper (OCR) y te los envía. \
-Recibirás ese texto (o una imagen). Interpreta qué es y responde de forma útil y directa:
-- Si es una pregunta o ejercicio, respóndela/resuélvelo.
-- Si es un término, concepto o definición, explícalo con claridad y un ejemplo breve.
-- Si es código o un error, explica qué hace o qué significa y cómo arreglarlo.
-- Si está en otro idioma, tradúcelo al español y explica lo importante.
-- Si son datos o una tabla, resume lo relevante.
-Las capturas de esta conversación suelen estar relacionadas (mismo documento, tema o \
-ejercicio): usa el contexto de capturas anteriores cuando ayude. El texto puede tener \
-errores de OCR; corrígelos mentalmente. No hagas preguntas de seguimiento: solo da la \
-respuesta. Cada mensaje indica un MODO con una instrucción concreta: síguela por encima \
-de las reglas generales. Responde en español (salvo lo que pida el modo), conciso (idealmente menos de 200 palabras), con markdown \
-ligero (negritas, listas).
-"""
+/// Languages Claude can answer in. "system" follows the Mac's preferred language.
+let languages = [
+    Opt(id: "system", label: "Match my Mac", detail: ""),
+    Opt(id: "en", label: "English", detail: ""),
+    Opt(id: "es", label: "Español", detail: ""),
+    Opt(id: "pt", label: "Português", detail: ""),
+    Opt(id: "fr", label: "Français", detail: ""),
+    Opt(id: "de", label: "Deutsch", detail: ""),
+]
+
+/// English name of the answer language, e.g. "Spanish".
+func answerLanguageName(_ id: String) -> String {
+    let code = id == "system" ? String((Locale.preferredLanguages.first ?? "en").prefix(2)) : id
+    return Locale(identifier: "en").localizedString(forLanguageCode: code) ?? "English"
+}
+
+func systemPrompt(language: String) -> String {
+    """
+    The user captures snippets of their screen with TextSniper (OCR) and sends them to you. \
+    You will receive that text (or an image). Work out what it is and answer in a useful, direct way:
+    - If it's a question or an exercise, answer or solve it.
+    - If it's a term, concept or definition, explain it clearly with a short example.
+    - If it's code or an error, explain what it does or means and how to fix it.
+    - If it's in another language, translate it and explain what matters.
+    - If it's data or a table, summarize what's relevant.
+    Captures in this conversation are usually related (same document, topic or exercise): \
+    use the context of earlier captures when it helps. The text may contain OCR errors; \
+    correct them silently. Don't ask follow-up questions: just give the answer. Each message \
+    names a MODE with a specific instruction: follow it over the general rules. Answer in \
+    \(language) (unless the mode asks otherwise), concisely (ideally under 200 words), with \
+    light markdown (bold, lists).
+    """
+}
 
 // MARK: - Pixel art
 
@@ -85,7 +103,7 @@ func pixelArt(_ rows: [String], px: CGFloat, pxH: CGFloat? = nil, palette: [Char
 }
 
 enum Pixel {
-    // Chispa de Claude (9x9)
+    // Claude spark (9x9)
     static let spark = [
         "....#....",
         ".#..#..#.",
@@ -97,7 +115,7 @@ enum Pixel {
         ".#..#..#.",
         "....#....",
     ]
-    // Clawd, la mascota pixel de Claude Code (17 de ancho)
+    // Clawd, Claude Code's pixel mascot (17 wide)
     static let body = ["...############..", "...##@######@##..", ".################", "...############.."]
     static let blinkBody = ["...############..", "...############..", ".################", "...############.."]
     static let legsA = "....#.#....#.#..."
@@ -110,7 +128,7 @@ enum Pixel {
     static func clawd(px: CGFloat, on: Bool = true) -> NSImage {
         pixelArt([empty] + body + [legsA], px: px, pxH: px * 2, palette: clawdPalette(on))
     }
-    /// Fotogramas para la animación de "pensando": camina y salta.
+    /// Frames for the "thinking" animation: walks and hops.
     static func clawdFrames(px: CGFloat) -> [NSImage] {
         let seqs: [[String]] = [
             [empty] + body + [legsA],
@@ -129,7 +147,7 @@ enum Pixel {
     }
 }
 
-// MARK: - Chats (caché de 15 min)
+// MARK: - Chats (15-minute cache)
 
 struct Chat: Codable { var id: String; var title: String; var created: Date; var lastUsed: Date; var count: Int }
 
@@ -170,7 +188,7 @@ final class ChatStore {
     }
     static func ago(_ d: Date) -> String {
         let m = Int(Date().timeIntervalSince(d) / 60)
-        return m < 1 ? "ahora" : "hace \(m) min"
+        return m < 1 ? "just now" : "\(m) min ago"
     }
 }
 
@@ -182,13 +200,13 @@ func findClaude() -> String? {
     return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
 }
 
-/// Entorno limpio: así el CLI usa tu sesión de Claude Code (tu plan).
+/// Clean environment, so the CLI uses your own Claude Code login (your plan).
 func cleanEnv() -> [String: String] {
     [
         "HOME": home,
         "USER": NSUserName(),
         "PATH": "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-        "LANG": "es_ES.UTF-8",
+        "LANG": "en_US.UTF-8",
         "TERM": "dumb",
     ]
 }
@@ -261,6 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var model: String { defaults.string(forKey: "model") ?? "haiku" }
     var effort: String { defaults.string(forKey: "effort") ?? "low" }
     var defaultMode: String { defaults.string(forKey: "mode") ?? "auto" }
+    var answerLanguage: String { defaults.string(forKey: "answerLanguage") ?? "system" }
 
     struct Capture { let text: String?; let imagePath: String?; let preview: String }
     var lastCapture: Capture?
@@ -283,21 +302,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Vista previa del pop-up sin llamar a Claude: `open ClaudeSniper.app --args --demo`
+    /// Preview the pop-up without calling Claude: `open ClaudeSniper.app --args --demo`
     func demo() {
-        let q = "¿Qué es la fotosíntesis y por qué es importante?"
+        let q = "What is photosynthesis and why does it matter?"
         lastCapture = Capture(text: q, imagePath: nil, preview: q)
         popup.mode = "explain"
-        popup.show(header: header(), preview: q, state: .loading, footer: "Empezando chat nuevo…")
+        popup.show(header: header(), preview: q, state: .loading, footer: "Starting a new chat…")
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
             self.popup.show(header: self.header(), preview: q, state: .result("""
-            La **fotosíntesis** es el proceso con el que plantas, algas y algunas bacterias convierten luz solar en energía química.
+            **Photosynthesis** is the process plants, algae and some bacteria use to turn sunlight into chemical energy.
 
-            - **Entrada:** luz + agua (`H₂O`) + dióxido de carbono (`CO₂`)
-            - **Salida:** glucosa (alimento) + oxígeno (`O₂`)
+            - **In:** light + water (`H₂O`) + carbon dioxide (`CO₂`)
+            - **Out:** glucose (food) + oxygen (`O₂`)
 
-            Es importante porque produce *casi todo el oxígeno* que respiramos y es la base de las cadenas alimenticias.
-            """), footer: "Chat · 3 capturas · expira en 15 min")
+            It matters because it produces *almost all the oxygen* we breathe and is the base of every food chain.
+            """), footer: "Chat · 3 captures · expires in 15 min")
         }
     }
 
@@ -312,7 +331,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func updateIcon() {
         statusItem.button?.image = Pixel.menuBarIcon(on: enabled)
-        statusItem.button?.toolTip = enabled ? "ClaudeSniper: activado" : "ClaudeSniper: desactivado"
+        statusItem.button?.toolTip = enabled ? "ClaudeSniper: on" : "ClaudeSniper: off"
     }
 
     // MARK: Menu
@@ -322,35 +341,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
         menu.addItem(viewItem(headerView()))
         menu.addItem(.separator())
-        menu.addItem(viewItem(segmentView(title: "MODELO", opts: models, selected: model, action: #selector(modelChanged(_:)))))
-        menu.addItem(viewItem(segmentView(title: "ESFUERZO", opts: efforts, selected: effort, action: #selector(effortChanged(_:)))))
+        menu.addItem(viewItem(segmentView(title: "MODEL", opts: models, selected: model, action: #selector(modelChanged(_:)))))
+        menu.addItem(viewItem(segmentView(title: "EFFORT", opts: efforts, selected: effort, action: #selector(effortChanged(_:)))))
         menu.addItem(viewItem(modeView()))
+        let langItem = item("Answer in: \(isDemo ? "English" : label(languages, answerLanguage))", "globe", nil)
+        let langMenu = NSMenu()
+        for l in languages {
+            let it = NSMenuItem(title: l.id == "system" ? "\(l.label) (\(answerLanguageName("system")))" : l.label,
+                                action: #selector(languageChanged(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = l.id
+            it.state = l.id == answerLanguage ? .on : .off
+            langMenu.addItem(it)
+        }
+        langItem.submenu = langMenu
+        menu.addItem(langItem)
         menu.addItem(.separator())
 
         // Chat
         menu.addItem(viewItem(sectionLabel("CHAT")))
-        if let c = store.active {
+        // Demo mode shows a sample chat so screenshots don't expose real captures.
+        let shown = isDemo ? Chat(id: "demo", title: "What is photosynthesis and why does it matter?",
+                                  created: Date(), lastUsed: Date(), count: 3) : store.active
+        if let c = shown {
             menu.addItem(info("bubble.left.and.bubble.right.fill", claudeOrange,
-                              "“\(c.title)”", "\(c.count) captura\(c.count == 1 ? "" : "s") · expira en \(ChatStore.minutesLeft(c)) min"))
+                              "“\(c.title)”", "\(c.count) capture\(c.count == 1 ? "" : "s") · expires in \(ChatStore.minutesLeft(c)) min"))
         } else {
             menu.addItem(info("bubble.left.and.bubble.right", .secondaryLabelColor,
-                              "Sin chat activo", "La próxima captura empieza uno nuevo"))
+                              "No active chat", "Your next capture starts a new one"))
         }
-        let newItem = item("Nuevo chat", "square.and.pencil", #selector(newChat), key: "n")
-        newItem.isEnabled = store.active != nil
+        let newItem = item("New chat", "square.and.pencil", #selector(newChat), key: "n")
+        newItem.isEnabled = shown != nil
         menu.addItem(newItem)
-        let switchItem = item("Cambiar de chat", "arrow.left.arrow.right", nil)
+        let switchItem = item("Switch chat", "arrow.left.arrow.right", nil)
         let sub = NSMenu()
         for c in store.recent {
             let it = NSMenuItem(title: "", action: #selector(switchChat(_:)), keyEquivalent: "")
             it.target = self
             it.representedObject = c.id
             it.state = c.id == store.activeID ? .on : .off
-            it.attributedTitle = twoLine(c.title, "\(c.count) captura\(c.count == 1 ? "" : "s") · \(ChatStore.ago(c.lastUsed)) · expira en \(ChatStore.minutesLeft(c)) min")
+            it.attributedTitle = twoLine(c.title, "\(c.count) capture\(c.count == 1 ? "" : "s") · \(ChatStore.ago(c.lastUsed)) · expires in \(ChatStore.minutesLeft(c)) min")
             sub.addItem(it)
         }
         if sub.items.isEmpty {
-            let it = NSMenuItem(title: "No hay chats recientes (duran 15 min)", action: nil, keyEquivalent: "")
+            let it = NSMenuItem(title: "No recent chats (they last 15 min)", action: nil, keyEquivalent: "")
             it.isEnabled = false
             sub.addItem(it)
         }
@@ -358,26 +392,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(switchItem)
         menu.addItem(.separator())
 
-        // Estado
+        // Status
         if findClaude() == nil {
-            menu.addItem(status(false, "Claude Code no está instalado", action: nil))
+            menu.addItem(status(false, "Claude Code is not installed", action: nil))
         } else if loggedIn == true {
-            menu.addItem(status(true, "Conectado a tu plan de Claude" + (account.isEmpty ? "" : " · \(account)"), action: nil))
+            menu.addItem(status(true, "Connected to your Claude plan" + (account.isEmpty ? "" : " · \(account)"), action: nil))
         } else {
-            menu.addItem(status(false, loggedIn == nil ? "Comprobando conexión…" : "Iniciar sesión en Claude…", action: #selector(login)))
+            menu.addItem(status(false, loggedIn == nil ? "Checking connection…" : "Sign in to Claude…", action: #selector(login)))
         }
         if CGPreflightListenEventAccess() {
-            menu.addItem(status(true, "Atajo ⌘⇧2 detectado", action: nil))
+            menu.addItem(status(true, "⌘⇧2 shortcut detected", action: nil))
         } else {
-            menu.addItem(status(false, "Dar permiso de teclado (⌘⇧2)…", action: #selector(askKeyboardPermission)))
+            menu.addItem(status(false, "Allow keyboard access (⌘⇧2)…", action: #selector(askKeyboardPermission)))
         }
         menu.addItem(.separator())
-        menu.addItem(item("Interpretar portapapeles ahora", "wand.and.stars", #selector(testNow)))
-        let li = item("Abrir al iniciar sesión", "power", #selector(toggleLoginItem))
+        menu.addItem(item("Interpret clipboard now", "wand.and.stars", #selector(testNow)))
+        let li = item("Open at login", "power", #selector(toggleLoginItem))
         li.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(li)
         menu.addItem(.separator())
-        menu.addItem(item("Salir de ClaudeSniper", "xmark.circle", #selector(NSApp.terminate(_:)), key: "q"))
+        menu.addItem(item("Quit ClaudeSniper", "xmark.circle", #selector(NSApp.terminate(_:)), key: "q"))
     }
 
     func viewItem(_ v: NSView) -> NSMenuItem { let it = NSMenuItem(); it.view = v; return it }
@@ -434,7 +468,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let title = NSTextField(labelWithString: "ClaudeSniper")
         title.font = .systemFont(ofSize: 14, weight: .bold)
         title.frame = NSRect(x: 62, y: 29, width: 160, height: 18)
-        let sub = NSTextField(labelWithString: enabled ? "Activo · usa ⌘⇧2 en TextSniper" : "Desactivado")
+        let sub = NSTextField(labelWithString: enabled ? "On · press ⌘⇧2 in TextSniper" : "Off")
         sub.font = .systemFont(ofSize: 11)
         sub.textColor = enabled ? claudeOrange : .secondaryLabelColor
         sub.frame = NSRect(x: 62, y: 12, width: 180, height: 15)
@@ -477,13 +511,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         seg.selectedSegment = modes.firstIndex { $0.id == defaultMode } ?? 0
         seg.frame = NSRect(x: 12, y: 6, width: menuWidth - 24, height: 24)
         if #available(macOS 14.0, *) { seg.selectedSegmentBezelColor = claudeOrange }
-        for (i, m) in modes.enumerated() { seg.setToolTip("\(m.label) — tecla \(i + 1) en el pop-up", forSegment: i) }
+        for (i, m) in modes.enumerated() { seg.setToolTip("\(m.label) — key \(i + 1) in the pop-up", forSegment: i) }
         v.addSubview(l); v.addSubview(seg)
         return v
     }
 
     func setModeTitle() {
-        let s = NSMutableAttributedString(string: "MODO POR DEFECTO  ", attributes: [
+        let s = NSMutableAttributedString(string: "DEFAULT MODE  ", attributes: [
             .font: NSFont.systemFont(ofSize: 10, weight: .semibold), .foregroundColor: NSColor.secondaryLabelColor])
         s.append(NSAttributedString(string: mode(defaultMode).label, attributes: [
             .font: NSFont.systemFont(ofSize: 11, weight: .semibold), .foregroundColor: claudeOrange]))
@@ -494,6 +528,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         defaults.set(modes[s.selectedSegment].id, forKey: "mode")
         setModeTitle()
     }
+
+    @objc func languageChanged(_ i: NSMenuItem) { defaults.set(i.representedObject as? String, forKey: "answerLanguage") }
 
     @objc func switchChanged(_ s: NSSwitch) {
         enabled = s.state == .on
@@ -521,9 +557,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let script = """
         #!/bin/zsh
         unset ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDECODE
-        echo "Inicia sesión con tu cuenta de Claude (tu plan Pro/Max)…"
+        echo "Sign in with your Claude account (your Pro/Max plan)…"
         "\(claude)" auth login
-        echo; echo "Listo. Ya puedes cerrar esta ventana."
+        echo; echo "Done. You can close this window."
         """
         try? script.write(toFile: path, atomically: true, encoding: .utf8)
         chmod(path, 0o755)
@@ -575,7 +611,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func hotkeyPressed() {
         guard enabled else { return }
         lastChange = NSPasteboard.general.changeCount
-        armedUntil = Date().addingTimeInterval(30)  // tiempo para seleccionar el área
+        armedUntil = Date().addingTimeInterval(30)  // time to select the area
     }
 
     func poll() {
@@ -593,9 +629,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func chatFooter() -> String {
         if let c = store.active {
-            return "Chat · \(c.count) captura\(c.count == 1 ? "" : "s") · expira en \(ChatStore.minutesLeft(c)) min"
+            return "Chat · \(c.count) capture\(c.count == 1 ? "" : "s") · expires in \(ChatStore.minutesLeft(c)) min"
         }
-        return "Chat nuevo · la próxima captura empieza de cero"
+        return "New chat · your next capture starts fresh"
     }
 
     func handleClipboard() {
@@ -604,25 +640,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lastCapture = Capture(text: s, imagePath: nil, preview: s)
         } else if let img = NSImage(pasteboard: pb), let tiff = img.tiffRepresentation,
                   let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
-            let path = workDir + "/captura-\(Int(Date().timeIntervalSince1970)).png"
+            let path = workDir + "/capture-\(Int(Date().timeIntervalSince1970)).png"
             try? png.write(to: URL(fileURLWithPath: path))
-            lastCapture = Capture(text: nil, imagePath: path, preview: "🖼  Imagen capturada")
+            lastCapture = Capture(text: nil, imagePath: path, preview: "🖼  Captured image")
         } else {
-            popup.show(header: header(), preview: "", state: .error("El portapapeles está vacío."), footer: chatFooter())
+            popup.show(header: header(), preview: "", state: .error("The clipboard is empty."), footer: chatFooter())
             return
         }
         run(lastCapture!, modeID: defaultMode, again: false)
     }
 
-    /// Envía la captura con un modo. `again` = la misma captura repetida desde el pop-up.
+    /// Sends a capture with a mode. `again` = the same capture re-run from the pop-up.
     func run(_ c: Capture, modeID: String, again: Bool) {
         let m = mode(modeID)
-        let head = again ? "Misma captura de antes, ahora en otro modo." : "Nueva captura."
+        let head = again ? "Same capture as before, now in another mode." : "New capture."
         let body: String
         if let t = c.text {
-            body = "\(head)\nMODO: \(m.label) — \(m.instruction)\n\nCaptura:\n\n\(t)"
+            body = "\(head)\nMODE: \(m.label) — \(m.instruction)\n\nCapture:\n\n\(t)"
         } else {
-            body = "\(head) Es una imagen: léela en \(c.imagePath!) con la herramienta Read.\nMODO: \(m.label) — \(m.instruction)"
+            body = "\(head) It is an image: read it at \(c.imagePath!) with the Read tool.\nMODE: \(m.label) — \(m.instruction)"
         }
         popup.mode = m.id
         ask(prompt: body, image: c.imagePath != nil, preview: c.preview)
@@ -637,7 +673,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func ask(prompt: String, image: Bool, preview: String) {
         guard let claude = findClaude() else {
-            popup.show(header: header(), preview: preview, state: .error("No encontré Claude Code. Instálalo con:\ncurl -fsSL https://claude.ai/install.sh | bash"), footer: "")
+            popup.show(header: header(), preview: preview, state: .error("Claude Code wasn't found. Install it with:\ncurl -fsSL https://claude.ai/install.sh | bash"), footer: "")
             return
         }
         running?.terminate()
@@ -651,10 +687,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let title = preview.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
 
         popup.show(header: hdr, preview: preview, state: .loading,
-                   footer: existing.map { "Chat · \($0.count) captura\($0.count == 1 ? "" : "s") · continúa" } ?? "Empezando chat nuevo…")
+                   footer: existing.map { "Chat · \($0.count) capture\($0.count == 1 ? "" : "s") · continuing" } ?? "Starting a new chat…")
 
         var args = ["-p", "--model", model, "--effort", effort, "--output-format", "text",
-                    "--system-prompt", systemPrompt]
+                    "--system-prompt", systemPrompt(language: answerLanguageName(answerLanguage))]
         args += existing == nil ? ["--session-id", sessionID] : ["--resume", sessionID]
         args += image ? ["--tools", "Read", "--allowedTools", "Read", "--add-dir", workDir] : ["--tools", ""]
 
@@ -667,18 +703,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.running = nil
                 let text = r.output.trimmingCharacters(in: .whitespacesAndNewlines)
                 if r.status == 0 && !text.isEmpty {
-                    // Si el usuario cambió/reinició el chat mientras esperaba, no lo pisamos.
+                    // If the user switched or reset the chat while waiting, don't override that.
                     self.store.record(id: sessionID, title: String(title.prefix(60)),
                                       makeActive: self.store.activeID == activeAtStart)
                     self.popup.show(header: hdr, preview: preview, state: .result(text), footer: self.chatFooter())
                 } else if existing != nil && text.localizedCaseInsensitiveContains("no conversation found") {
                     self.store.newChat()
-                    self.ask(prompt: prompt, image: image, preview: preview)  // reintenta en chat nuevo
+                    self.ask(prompt: prompt, image: image, preview: preview)  // retry in a new chat
                 } else if text.contains("authenticate") || text.contains("/login") || text.contains("401") {
                     self.loggedIn = false
-                    self.popup.show(header: hdr, preview: preview, state: .error("No has iniciado sesión en Claude Code.\nAbre el menú de la barra superior → “Iniciar sesión en Claude…”."), footer: "")
+                    self.popup.show(header: hdr, preview: preview, state: .error("You're not signed in to Claude Code.\nOpen the menu bar menu → “Sign in to Claude…”."), footer: "")
                 } else {
-                    self.popup.show(header: hdr, preview: preview, state: .error(text.isEmpty ? "Error desconocido (código \(r.status))." : text), footer: self.chatFooter())
+                    self.popup.show(header: hdr, preview: preview, state: .error(text.isEmpty ? "Unknown error (code \(r.status))." : text), footer: self.chatFooter())
                 }
             }
         }
@@ -708,7 +744,7 @@ final class PopupController: NSObject {
     let scroll = NSScrollView()
     let textView = NSTextView()
     let footerLabel = NSTextField(labelWithString: "")
-    let hintLabel = NSTextField(labelWithString: "1–6 cambiar modo · esc cerrar")
+    let hintLabel = NSTextField(labelWithString: "1–6 switch mode · esc close")
     var copyBtn: NSButton!
     var newBtn: NSButton!
     let frames = Pixel.clawdFrames(px: 2)
@@ -762,9 +798,9 @@ final class PopupController: NSObject {
         chip.layer?.backgroundColor = claudeOrange.withAlphaComponent(0.16).cgColor
         chip.layer?.cornerRadius = 8
 
-        copyBtn = iconButton("doc.on.doc", "Copiar respuesta", #selector(copyResult))
-        newBtn = iconButton("square.and.pencil", "Nuevo chat", #selector(newChat))
-        let closeBtn = iconButton("xmark", "Cerrar (esc)", #selector(close))
+        copyBtn = iconButton("doc.on.doc", "Copy answer", #selector(copyResult))
+        newBtn = iconButton("square.and.pencil", "New chat", #selector(newChat))
+        let closeBtn = iconButton("xmark", "Close (esc)", #selector(close))
 
         quoteBox.wantsLayer = true
         quoteBox.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.06).cgColor
@@ -813,7 +849,7 @@ final class PopupController: NSObject {
             b.symbolConfiguration = .init(pointSize: 10, weight: .semibold)
             b.wantsLayer = true
             b.layer?.cornerRadius = 11
-            b.toolTip = "\(m.label) (tecla \(i + 1)): repite esta captura en este modo"
+            b.toolTip = "\(m.label) (key \(i + 1)): re-run this capture in this mode"
             b.translatesAutoresizingMaskIntoConstraints = false
             b.heightAnchor.constraint(equalToConstant: 22).isActive = true
             b.widthAnchor.constraint(equalToConstant: b.intrinsicContentSize.width + 12).isActive = true
@@ -989,7 +1025,7 @@ final class PopupController: NSObject {
         setThinking()
     }
     func setThinking() {
-        textView.textStorage?.setAttributedString(NSAttributedString(string: "Pensando" + String(repeating: ".", count: dots),
+        textView.textStorage?.setAttributedString(NSAttributedString(string: "Thinking" + String(repeating: ".", count: dots),
             attributes: [.font: NSFont.systemFont(ofSize: 14, weight: .medium), .foregroundColor: claudeOrange]))
     }
     func stopAnimating() {
@@ -998,7 +1034,7 @@ final class PopupController: NSObject {
     }
 
     func positionNearMouse(height: CGFloat) {
-        if isDemo, let vf = NSScreen.main?.visibleFrame {   // demo: centrado, para capturas
+        if isDemo, let vf = NSScreen.main?.visibleFrame {   // demo: centered, for screenshots
             panel.setFrame(NSRect(x: vf.midX - width / 2, y: vf.midY - height / 2, width: width, height: height), display: true)
             showBackdrop(around: panel.frame)
             return
@@ -1013,7 +1049,7 @@ final class PopupController: NSObject {
     }
 
     var backdrop: NSWindow?
-    /// Fondo degradado detrás del pop-up en modo demo (para que el desenfoque se vea en capturas).
+    /// Gradient behind the pop-up in demo mode (so the blur shows up in screenshots).
     func showBackdrop(around f: NSRect) {
         backdrop?.orderOut(nil)
         let r = f.insetBy(dx: -70, dy: -60)
@@ -1042,14 +1078,14 @@ final class PopupController: NSObject {
     @objc func copyResult() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(resultText, forType: .string)
-        appDelegate?.lastChange = NSPasteboard.general.changeCount  // no lo trates como captura
+        appDelegate?.lastChange = NSPasteboard.general.changeCount  // don't treat this as a capture
         flash(copyBtn, "checkmark")
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { self.copyBtn.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil) }
     }
 
     @objc func newChat() {
         appDelegate?.store.newChat()
-        footerLabel.stringValue = "✓ Chat nuevo · la próxima captura empieza de cero"
+        footerLabel.stringValue = "✓ New chat · your next capture starts fresh"
         newBtn.contentTintColor = claudeOrange
     }
 

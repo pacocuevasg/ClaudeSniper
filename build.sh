@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Compila ClaudeSniper y lo instala en /Applications/ClaudeSniper.app
+# Builds ClaudeSniper and installs it to /Applications/ClaudeSniper.app
 set -e
 cd "$(dirname "$0")"
 APP=/Applications/ClaudeSniper.app
@@ -28,4 +28,4 @@ PLIST
 codesign --force --deep -s - "$BUILD"
 pkill -x ClaudeSniper 2>/dev/null || true
 rm -rf "$APP" && cp -R "$BUILD" "$APP"
-echo "Instalado en $APP"
+echo "Installed to $APP"

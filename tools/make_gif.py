@@ -1,4 +1,4 @@
-"""Genera docs/clawd.gif (Clawd caminando) con las mismas cuadrículas que la app."""
+"""Generates docs/clawd.gif (Clawd walking) from the same pixel grids the app uses."""
 from PIL import Image, ImageDraw
 import sys
 E = "................."
@@ -18,7 +18,7 @@ for f in FRAMES:
             if ch in COL:
                 d.rectangle([PAD + x*PX, PAD + y*PH, PAD + (x+1)*PX - 1, PAD + (y+1)*PH - 1], fill=COL[ch])
     imgs.append(im)
-# GIF con transparencia: paleta + índice transparente
+# Transparent GIF: palette + transparent index
 pal = []
 for im in imgs:
     p = im.convert("RGBA")

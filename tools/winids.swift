@@ -1,4 +1,4 @@
-// Lista las ventanas visibles de ClaudeSniper: "id capa x y ancho alto"
+// Lists ClaudeSniper's on-screen windows: "id layer x y width height" (used for README screenshots)
 import CoreGraphics
 let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as! [[String: Any]]
 for w in list where (w[kCGWindowOwnerName as String] as? String) == "ClaudeSniper" {
