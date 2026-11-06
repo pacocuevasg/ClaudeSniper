@@ -101,6 +101,8 @@ enum Settings {
     static var autoClose: Int { defaults.object(forKey: "autoClose") as? Int ?? 0 }
     static var autoCopy: Bool { defaults.bool(forKey: "autoCopy") }
     static var sound: Bool { defaults.bool(forKey: "sound") }
+    /// Haiku with no thinking, from a Claude Code process that's already running.
+    static var superFast: Bool { defaults.bool(forKey: "superFast") }
     /// Answers wait in a tiny Clawd instead of opening the pop-up.
     static var miniMode: Bool { defaults.bool(forKey: "miniMode") }
 }
@@ -394,12 +396,13 @@ final class StreamingRun {
     private(set) var isError = false
     var other = ""
     var onText: ((String) -> Void)?
+    var extraEnv: [String: String] = [:]
 
     func start(_ exe: String, _ args: [String], stdin: String, timeout: TimeInterval,
                done: @escaping (Int32, StreamingRun) -> Void) -> Bool {
         process.executableURL = URL(fileURLWithPath: exe)
         process.arguments = args
-        process.environment = cleanEnv()
+        process.environment = cleanEnv().merging(extraEnv) { $1 }
         process.currentDirectoryURL = URL(fileURLWithPath: workDir)
         let out = Pipe(), err = Pipe(), inp = Pipe()
         process.standardOutput = out
@@ -464,6 +467,109 @@ final class StreamingRun {
     }
 }
 
+/// Flags that make Claude Code start faster: no user settings, skills or MCP servers.
+let lightStart = ["--setting-sources", "", "--disable-slash-commands", "--strict-mcp-config"]
+let noThinkingEnv = ["MAX_THINKING_TOKENS": "0"]
+
+/// Super fast mode: Haiku, no extended thinking, light start.
+func fastArgs(_ systemPrompt: String) -> [String] {
+    ["-p", "--model", "haiku", "--effort", "low",
+     "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+     "--settings", #"{"alwaysThinkingEnabled": false}"#,
+     "--tools", "Read", "--allowedTools", "Read", "--add-dir", workDir,
+     "--system-prompt", systemPrompt] + lightStart
+}
+
+/// A Claude Code process started ahead of time that waits for the next question
+/// (stream-json input). It skips the 1–2 s startup that every answer otherwise pays.
+final class WarmProcess {
+    enum Event { case text(String), done(String, Bool), exited(String) }
+
+    let process = Process()
+    let sessionID: String
+    let key: String               // the system prompt it was started with
+    private(set) var busy = false
+    private(set) var used = false
+    var handler: ((Event) -> Void)?
+    private let input = Pipe()
+    private var buffer = Data()
+    private var text = ""
+    private var errData = Data()
+
+    init?(sessionID: String, resume: Bool, systemPrompt: String) {
+        self.sessionID = sessionID
+        self.key = systemPrompt
+        guard let claude = findClaude() else { return nil }
+        process.executableURL = URL(fileURLWithPath: claude)
+        process.arguments = fastArgs(systemPrompt) + ["--input-format", "stream-json"]
+            + (resume ? ["--resume", sessionID] : ["--session-id", sessionID])
+        process.environment = cleanEnv().merging(noThinkingEnv) { $1 }
+        process.currentDirectoryURL = URL(fileURLWithPath: workDir)
+        let out = Pipe(), err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+        process.standardInput = input
+        do { try process.run() } catch { return nil }
+        DispatchQueue.global().async { [weak self] in
+            let d = err.fileHandleForReading.readDataToEndOfFile()
+            DispatchQueue.main.async { self?.errData = d }
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            while true {
+                let d = out.fileHandleForReading.availableData
+                if d.isEmpty { break }
+                self?.consume(d)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                guard let self, self.busy else { return }
+                self.busy = false
+                self.handler?(.exited(String(decoding: self.errData, as: UTF8.self)))
+            }
+        }
+    }
+
+    var alive: Bool { process.isRunning }
+
+    /// Sends a question. Returns false if the process is gone.
+    func send(_ prompt: String) -> Bool {
+        guard alive else { return false }
+        busy = true
+        used = true
+        text = ""
+        let msg: [String: Any] = ["type": "user", "message": ["role": "user", "content": [["type": "text", "text": prompt]]]]
+        guard let d = try? JSONSerialization.data(withJSONObject: msg) else { return false }
+        do { try input.fileHandleForWriting.write(contentsOf: d + Data("\n".utf8)) } catch { busy = false; return false }
+        return true
+    }
+
+    func stop() { if process.isRunning { process.terminate() } }
+
+    private func consume(_ d: Data) {
+        buffer.append(d)
+        while let nl = buffer.firstIndex(of: 0x0A) {
+            let line = Data(buffer[buffer.startIndex..<nl])
+            buffer.removeSubrange(buffer.startIndex...nl)
+            guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+            switch obj["type"] as? String {
+            case "stream_event":
+                guard let ev = obj["event"] as? [String: Any] else { continue }
+                if ev["type"] as? String == "message_start" { text = "" }
+                if ev["type"] as? String == "content_block_delta", let delta = ev["delta"] as? [String: Any],
+                   delta["type"] as? String == "text_delta", let t = delta["text"] as? String {
+                    text += t
+                    let snapshot = text
+                    DispatchQueue.main.async { self.handler?(.text(snapshot)) }
+                }
+            case "result":
+                let r = obj["result"] as? String ?? text
+                let e = obj["is_error"] as? Bool ?? false
+                DispatchQueue.main.async { self.busy = false; self.handler?(.done(r, e)) }
+            default: break
+            }
+        }
+    }
+}
+
 // MARK: - Global shortcut to reopen the last answer (⌥⌘2, no permission needed)
 
 func registerShowLastHotkey() {
@@ -519,6 +625,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     struct Shown { let header: String; let preview: String; let text: String; let mode: String; let footer: String; let replace: Bool }
     var lastShown: Shown?
     var testMode: String?
+    var testTimingLog: Bool { CommandLine.arguments.contains("--interpret-clipboard") }
     var pendingFollowUp: String?
     lazy var popup = PopupController()
     lazy var mini = MiniClawd()
@@ -560,7 +667,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var enabled: Bool {
         get { defaults.bool(forKey: "enabled") }
-        set { defaults.set(newValue, forKey: "enabled"); updateIcon(); newValue ? startMonitoring() : stopMonitoring() }
+        set {
+            defaults.set(newValue, forKey: "enabled"); updateIcon()
+            if newValue { startMonitoring(); prewarm() } else { stopMonitoring(); stopWarm() }
+        }
     }
     var model: String { defaults.string(forKey: "model") ?? "haiku" }
     var effort: String { defaults.string(forKey: "effort") ?? "low" }
@@ -569,6 +679,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     struct Capture { let text: String?; let imagePath: String?; let preview: String }
     var lastCapture: Capture?
+
+    func applicationWillTerminate(_ n: Notification) { stopWarm() }
 
     func applicationDidFinishLaunching(_ n: Notification) {
         appDelegate = self
@@ -583,6 +695,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if enabled { startMonitoring() }
         refreshAuth()
         registerShowLastHotkey()
+        signal(SIGPIPE, SIG_IGN)  // a preloaded process may close its input
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.prewarm() }
         if CommandLine.arguments.contains("--demo") { demo() }
         // Testing without TextSniper: interpret what's on the clipboard, optionally in a mode,
         // then ask a follow-up. e.g. --interpret-clipboard --mode fix --follow-up "Why?"
@@ -602,7 +716,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if a.contains("--interpret-clipboard") {
             testMode = value("--mode")
             pendingFollowUp = value("--follow-up")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.handleClipboard() }
+            let after = value("--after").flatMap(Double.init) ?? 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + after) { self.handleClipboard() }
         }
         if CommandLine.arguments.contains("--demo-settings") {   // shows the Settings submenu on its own
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
@@ -659,6 +774,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(viewItem(segmentView(title: "EFFORT", opts: efforts, selected: effort, action: #selector(effortChanged(_:)))))
         menu.addItem(viewItem(modeView()))
         menu.addItem(myModesItem())
+        let fastItem = item("Super fast mode", "bolt.fill", #selector(toggleSuperFast))
+        fastItem.state = Settings.superFast ? .on : .off
+        fastItem.toolTip = "Haiku with no extended thinking, from a Claude Code process that's already waiting. Answers in about a second."
+        menu.addItem(fastItem)
+        if Settings.superFast {
+            for it in menu.items { it.view?.subviews.compactMap { $0 as? NSSegmentedControl }.filter { $0.action == #selector(modelChanged(_:)) || $0.action == #selector(effortChanged(_:)) }.forEach { $0.isEnabled = false } }
+        }
         let langItem = item("Answer in: \(isDemo ? "English" : label(languages, answerLanguage))", "globe", nil)
         let langMenu = NSMenu()
         for l in languages {
@@ -1258,14 +1380,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         run(c, modeID: modeID, again: true)
     }
 
-    func header() -> String { "\(label(models, model)) · \(label(efforts, effort).lowercased())" }
+    func header() -> String {
+        Settings.superFast ? "Haiku · ⚡ super fast" : "\(label(models, model)) · \(label(efforts, effort).lowercased())"
+    }
 
-    func ask(prompt: String, image: Bool, preview: String, followUp: String? = nil) {
+    func ask(prompt: String, image: Bool, preview: String, followUp: String? = nil, allowWarm: Bool = true) {
         guard let claude = findClaude() else {
             popup.show(header: header(), preview: preview, state: .error("Claude Code wasn't found. Install it with:\ncurl -fsSL https://claude.ai/install.sh | bash"), footer: "")
             return
         }
         current?.process.terminate()
+        current = nil
         requestID += 1
         // Mini Clawd: only when the pop-up isn't already open (re-runs and follow-ups stay in it).
         miniThisRequest = Settings.miniMode && !popup.panel.isVisible
@@ -1274,37 +1399,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let modeLabel = mode(popup.mode).label
         let captureText = lastCapture?.text ?? "[image]"
         popup.allowReplace = followUp == nil
+        let fast = Settings.superFast
+        let sys = systemPrompt(language: answerLanguageName(answerLanguage), length: Settings.answerLength)
 
         // A follow-up always continues the conversation of the last answer.
         let existing = store.active
         let resumeID = followUp != nil ? lastSessionID : existing?.id
-        let sessionID = resumeID ?? UUID().uuidString.lowercased()
+        // Super fast: use a Claude Code process that is already running and waiting.
+        let warm = fast && allowWarm ? warmProcess(resumeID: resumeID, systemPrompt: sys) : nil
+        let sessionID = warm?.sessionID ?? resumeID ?? UUID().uuidString.lowercased()
         let activeAtStart = store.activeID
         let title = preview.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
 
         display(header: hdr, preview: preview, state: .loading,
-                   footer: followUp != nil ? "Follow-up · same chat"
-                       : existing.map { "Chat · \($0.count) capture\($0.count == 1 ? "" : "s") · continuing" } ?? "Starting a new chat…")
+                footer: followUp != nil ? "Follow-up · same chat"
+                    : existing.map { "Chat · \($0.count) capture\($0.count == 1 ? "" : "s") · continuing" } ?? "Starting a new chat…")
 
-        var args = ["-p", "--model", model, "--effort", effort,
-                    "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-                    "--strict-mcp-config",  // skip your MCP servers: faster start
-                    "--system-prompt", systemPrompt(language: answerLanguageName(answerLanguage), length: Settings.answerLength)]
-        args += resumeID == nil ? ["--session-id", sessionID] : ["--resume", sessionID]
-        args += image ? ["--tools", "Read", "--allowedTools", "Read", "--add-dir", workDir] : ["--tools", ""]
-
-        let run = StreamingRun()
-        current = run
-        run.onText = { [weak self] t in
-            guard let self, myID == self.requestID, !t.isEmpty else { return }
-            self.display(header: hdr, preview: preview, state: .streaming(t), footer: "Writing…")
+        let t0 = Date()
+        var firstText = true
+        func logTiming(_ what: String) {   // only when testing with --interpret-clipboard
+            guard self.testTimingLog else { return }
+            let line = String(format: "%@ %@ %.2fs\n", followUp == nil ? "capture" : "follow-up", what, Date().timeIntervalSince(t0))
+            if let h = FileHandle(forWritingAtPath: workDir + "/timing.log") { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
+            else { try? line.write(toFile: workDir + "/timing.log", atomically: true, encoding: .utf8) }
         }
-        let started = run.start(claude, args, stdin: prompt, timeout: 300) { status, r in
+        let finish: (Int32, String, Bool, String) -> Void = { status, raw, isError, errRaw in
             guard myID == self.requestID else { return }
-            self.current = nil
-            let text = (r.result ?? r.text).trimmingCharacters(in: .whitespacesAndNewlines)
-            let errText = r.other.trimmingCharacters(in: .whitespacesAndNewlines)
-            if status == 0 && !r.isError && !text.isEmpty {
+            logTiming("full answer (\(warm != nil ? "preloaded" : "normal"))")
+            let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            let errText = errRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if status == 0 && !isError && !text.isEmpty {
                 self.lastSessionID = sessionID
                 // If the user switched or reset the chat while waiting, don't override that.
                 self.store.record(id: sessionID, title: String(title.prefix(60)),
@@ -1324,6 +1448,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.pendingFollowUp = nil
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.followUp(q) }
                 }
+                self.prewarm()  // get the next spare ready while you read
                 return
             }
             let all = text + "\n" + errText
@@ -1338,9 +1463,97 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.display(header: hdr, preview: preview, state: .error(msg), footer: self.chatFooter())
             }
         }
+
+        if let w = warm {
+            w.handler = { [weak self] ev in
+                guard let self, myID == self.requestID else { return }
+                switch ev {
+                case .text(let t):
+                    if firstText && !t.isEmpty { firstText = false; logTiming("first words") }
+                    if !t.isEmpty { self.display(header: hdr, preview: preview, state: .streaming(t), footer: "Writing…") }
+                case .done(let r, let e):
+                    finish(0, r, e, "")
+                case .exited:
+                    // The preloaded process stopped: answer the normal way instead.
+                    if self.chatWarm === w { self.chatWarm = nil }
+                    self.ask(prompt: prompt, image: image, preview: preview, followUp: followUp, allowWarm: false)
+                }
+            }
+            if !w.send(prompt) {
+                if chatWarm === w { chatWarm = nil }
+                ask(prompt: prompt, image: image, preview: preview, followUp: followUp, allowWarm: false)
+            }
+            return
+        }
+
+        var args: [String]
+        if fast {
+            args = fastArgs(sys)
+        } else {
+            args = ["-p", "--model", model, "--effort", effort,
+                    "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+                    "--system-prompt", sys] + lightStart
+            args += image ? ["--tools", "Read", "--allowedTools", "Read", "--add-dir", workDir] : ["--tools", ""]
+        }
+        args += resumeID == nil ? ["--session-id", sessionID] : ["--resume", sessionID]
+
+        let run = StreamingRun()
+        if fast { run.extraEnv = noThinkingEnv }
+        current = run
+        run.onText = { [weak self] t in
+            guard let self, myID == self.requestID, !t.isEmpty else { return }
+            if firstText { firstText = false; logTiming("first words") }
+            self.display(header: hdr, preview: preview, state: .streaming(t), footer: "Writing…")
+        }
+        let started = run.start(claude, args, stdin: prompt, timeout: 300) { status, r in
+            guard myID == self.requestID else { return }
+            self.current = nil
+            finish(status, r.result ?? r.text, r.isError, r.other)
+        }
         if !started {
             display(header: hdr, preview: preview, state: .error("Couldn't start Claude Code: \(run.other)"), footer: "")
         }
+    }
+
+    // MARK: Super fast mode (preloaded Claude Code processes)
+
+    var chatWarm: WarmProcess?    // the current chat, ready for the next capture
+    var spareWarm: WarmProcess?   // a fresh session, ready for the next new chat
+
+    /// Starts a spare process in the background so the next new chat answers right away.
+    func prewarm() {
+        guard Settings.superFast, enabled else { return }
+        let sys = systemPrompt(language: answerLanguageName(answerLanguage), length: Settings.answerLength)
+        if let s = spareWarm, s.alive, !s.used, s.key == sys { return }
+        spareWarm?.stop()
+        spareWarm = WarmProcess(sessionID: UUID().uuidString.lowercased(), resume: false, systemPrompt: sys)
+    }
+
+    func stopWarm() {
+        chatWarm?.stop(); spareWarm?.stop()
+        chatWarm = nil; spareWarm = nil
+    }
+
+    /// The preloaded process to use for this request (starting one if needed).
+    func warmProcess(resumeID: String?, systemPrompt sys: String) -> WarmProcess? {
+        if let id = resumeID {
+            if let w = chatWarm, w.sessionID == id, w.alive, !w.busy, w.key == sys { return w }
+            chatWarm?.stop()
+            chatWarm = WarmProcess(sessionID: id, resume: true, systemPrompt: sys)
+            return chatWarm
+        }
+        var w = spareWarm
+        if let s = w, !s.alive || s.used || s.busy || s.key != sys { s.stop(); w = nil }
+        if w == nil { w = WarmProcess(sessionID: UUID().uuidString.lowercased(), resume: false, systemPrompt: sys) }
+        spareWarm = nil
+        chatWarm?.stop()
+        chatWarm = w
+        return w
+    }
+
+    @objc func toggleSuperFast() {
+        defaults.set(!Settings.superFast, forKey: "superFast")
+        Settings.superFast ? prewarm() : stopWarm()
     }
 
     /// A question about the last answer, typed in the pop-up (tab).
