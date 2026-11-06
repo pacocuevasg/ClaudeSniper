@@ -38,17 +38,20 @@ A native macOS menu bar app that connects [TextSniper](https://textsniper.app) t
 
 ### Features
 
-- **On/off toggle** in the menu bar (the spark turns orange when it's on).
-- **Model:** Haiku · Sonnet · Opus · Fable.
-- **Effort:** from *low* (answers in seconds) to *max*.
-- **6 quick action modes:** ✨ Auto · 💡 Explain · 💬 Translate · ≡ Summarize · ƒ Solve · ✓ Fix.
-- **Re-run the same capture in another mode** with the pop-up buttons or keys **1–6**.
-- **Chat memory:** captures in a row share context; after 15 minutes without use (configurable), a new chat starts. You can also start a new chat or switch between recent ones.
-- **Answer language:** match your Mac, or pick English, Español, Português, Français or Deutsch.
+- **Live answers:** the text appears while Claude writes it.
+- **Model:** Haiku · Sonnet · Opus · Fable. **Effort:** from *low* (seconds) to *max*.
+- **6 quick modes:** ✨ Auto · 💡 Explain · 💬 Translate · ≡ Summarize · ƒ Solve · ✓ Fix. Keys **1–6** re-run the same capture in another mode.
+- **Your own modes:** up to 3, with your own instruction (keys 7–9), from **My modes** in the menu.
+- **Follow-up questions:** press **Tab** in the pop-up to ask "and why?" in the same chat.
+- **Replace:** in Fix and Translate, paste the result back where you captured it.
+- **Read aloud** in the answer's language.
+- **Chat memory:** captures in a row share context (15 minutes by default, adjustable). Start a new chat or switch between recent ones.
+- **History:** every answer is saved and searchable. **Export a chat** to Markdown or Apple Notes.
+- **Show last answer:** ⌥⌘2 brings the pop-up back.
+- **Answer language:** match your Mac, or English, Español, Português, Français or Deutsch.
+- **Settings:** answer length, pop-up position, auto-close, auto-copy, a sound when the answer arrives, a custom capture shortcut, open at login.
 - **Images:** if the clipboard holds an image, Claude analyzes it.
 - **Pixel-art Clawd** walks while Claude thinks.
-- **Settings:** chat memory (off, 5 min to 1 hour), answer length, pop-up position, auto-close, auto-copy, a sound when the answer arrives, a custom capture shortcut, clear all chats, open at login.
-- Copy the answer and `esc` to close.
 
 </td>
 </tr>
@@ -86,6 +89,8 @@ No keyboard permission is needed: ClaudeSniper notices TextSniper's capture over
 
 > [!TIP]
 > To preview the pop-up without using your plan: `open /Applications/ClaudeSniper.app --args --demo`
+>
+> To test without TextSniper, copy some text and run `open /Applications/ClaudeSniper.app --args --interpret-clipboard --mode explain`
 
 ## How it works
 
@@ -101,7 +106,7 @@ TextSniper copies the text ──► clipboard changes while the overlay is up
                               pop-up with the answer
 ```
 
-- **No API key:** it runs the Claude Code CLI in non-interactive mode (`claude -p`), so it uses your regular Claude plan.
+- **No API key:** it runs the Claude Code CLI in non-interactive mode (`claude -p --output-format stream-json`), so it uses your regular Claude plan and shows the answer as it's written. Your MCP servers aren't loaded (`--strict-mcp-config`), which keeps it fast.
 - **Chats:** the first capture creates a session (`--session-id`) and later ones continue it (`--resume`) until the chat memory time passes without use.
 - **One file:** [`main.swift`](main.swift), plain AppKit, no dependencies. The pixel art is drawn in code from text grids.
 
@@ -109,14 +114,15 @@ TextSniper copies the text ──► clipboard changes while the overlay is up
 
 - No keyboard monitoring is needed: ClaudeSniper only checks whether TextSniper's capture window is on screen when the clipboard changes. (If you do allow *Input Monitoring*, it also listens for your capture shortcut with a listen-only event tap that never blocks or changes keys.)
 - Only what TextSniper copies is sent to Claude (or what you send with "Interpret clipboard now").
-- Conversations are stored where Claude Code keeps its sessions (`~/.claude/projects/`). Temporary image captures are deleted after 24 hours.
+- Conversations are stored where Claude Code keeps its sessions (`~/.claude/projects/`). The answer history is a local file (`~/Library/Application Support/ClaudeSniper/history.json`, last 500 answers) that you can clear from the History window. Temporary image captures are deleted after 24 hours.
+- **Replace** pastes automatically only if you allow *Accessibility* (Settings → Allow auto-paste); otherwise it copies and you press ⌘V. **Export to Notes** asks macOS for permission to control Notes the first time.
 
 ## Customize
 
 Most things are in the menu under **Settings**. For deeper changes, everything is at the top of [`main.swift`](main.swift):
 
 - `systemPrompt`: how Claude answers (style, rules).
-- `modes`: add or change quick action modes (name, SF Symbol icon and instruction).
+- `builtInModes`: the six built-in quick action modes (name, SF Symbol icon and instruction). For your own modes you don't need code: use **My modes** in the menu.
 - `languages`: the answer languages offered in the menu.
 - `Settings` and the `…Options` lists: the choices shown in the Settings menu.
 

@@ -7,6 +7,10 @@
 import Cocoa
 import ServiceManagement
 import Carbon.HIToolbox
+import ApplicationServices
+import AVFoundation
+import NaturalLanguage
+import UniformTypeIdentifiers
 
 let defaults = UserDefaults.standard
 let isDemo = CommandLine.arguments.contains { $0.hasPrefix("--demo") }
@@ -32,23 +36,43 @@ let efforts = [
 ]
 func label(_ opts: [Opt], _ id: String) -> String { opts.first { $0.id == id }?.label ?? id }
 
-/// Quick action modes. In the pop-up, switch with the buttons or keys 1–6.
+/// Quick action modes. In the pop-up, switch with the buttons or keys 1–6 (7–9 for your own modes).
 struct Mode { let id: String; let label: String; let symbol: String; let instruction: String }
-let modes = [
+let builtInModes = [
     Mode(id: "auto", label: "Auto", symbol: "sparkles",
          instruction: "Interpret the capture and give the most useful answer, following the general rules."),
     Mode(id: "explain", label: "Explain", symbol: "lightbulb",
          instruction: "Explain clearly what it means, as if to a student, with a simple example."),
     Mode(id: "translate", label: "Translate", symbol: "character.bubble",
-         instruction: "Translate it into the answer language; if it is already in that language, translate it into English (or into Spanish if the answer language is English). Give only the translation first, then, if useful, 1–3 short notes on nuances."),
+         instruction: "Translate it into the answer language; if it is already in that language, translate it into English (or into Spanish if the answer language is English). Write only the translation first. If notes on nuances help, add a line containing only --- and then 1–3 short notes."),
     Mode(id: "summarize", label: "Summarize", symbol: "list.bullet",
          instruction: "Summarize the essentials in 3–5 short bullet points."),
     Mode(id: "solve", label: "Solve", symbol: "function",
          instruction: "Solve it step by step, numbering the steps, and end with the final answer in bold."),
     Mode(id: "fix", label: "Fix", symbol: "checkmark.seal",
-         instruction: "Fix spelling, grammar and style without changing the language or the meaning. Return the full corrected text first, then a short list of the changes."),
+         instruction: "Fix spelling, grammar and style without changing the language or the meaning. Write the full corrected text first (plain text, no quotes or heading), then a line containing only ---, then a short list of the changes."),
 ]
-func mode(_ id: String) -> Mode { modes.first { $0.id == id } ?? modes[0] }
+/// Modes you create from the menu (up to 3, keys 7–9).
+struct CustomMode: Codable { var name: String; var instruction: String }
+var customModes: [CustomMode] {
+    get { defaults.data(forKey: "customModes").flatMap { try? JSONDecoder().decode([CustomMode].self, from: $0) } ?? [] }
+    set { defaults.set(try? JSONEncoder().encode(newValue), forKey: "customModes") }
+}
+func allModes() -> [Mode] {
+    builtInModes + customModes.map { Mode(id: "custom:" + $0.name, label: $0.name, symbol: "star", instruction: $0.instruction) }
+}
+func mode(_ id: String) -> Mode { allModes().first { $0.id == id } ?? builtInModes[0] }
+
+/// Modes whose answer starts with text worth pasting back (the "Replace" button).
+let replaceableModes: Set<String> = ["fix", "translate"]
+/// The part of an answer before a line with only "---".
+func mainPart(_ answer: String) -> String {
+    let lines = answer.components(separatedBy: "\n")
+    if let i = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces).range(of: #"^-{3,}$"#, options: .regularExpression) != nil }) {
+        return lines[..<i].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    return answer.trimmingCharacters(in: .whitespacesAndNewlines)
+}
 
 /// Languages Claude can answer in. "system" follows the Mac's preferred language.
 let languages = [
@@ -222,6 +246,99 @@ final class ChatStore {
     }
 }
 
+// MARK: - History (every answer, saved on disk)
+
+struct HistoryEntry: Codable {
+    var id = UUID().uuidString
+    var date = Date()
+    var chatID: String
+    var mode: String
+    var model: String
+    var capture: String
+    var followUp: String?
+    var answer: String
+}
+
+final class HistoryStore {
+    static let maxEntries = 500
+    private(set) var entries: [HistoryEntry] = []
+    let url = URL(fileURLWithPath: workDir + "/history.json")
+
+    init() {
+        if let d = try? Data(contentsOf: url) {
+            let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601
+            entries = (try? dec.decode([HistoryEntry].self, from: d)) ?? []
+        }
+    }
+    func add(_ e: HistoryEntry) {
+        entries.append(e)
+        if entries.count > Self.maxEntries { entries.removeFirst(entries.count - Self.maxEntries) }
+        save()
+    }
+    func clear() { entries = []; save() }
+    func chat(_ id: String) -> [HistoryEntry] { entries.filter { $0.chatID == id } }
+    func save() {
+        let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
+        try? enc.encode(entries).write(to: url, options: .atomic)
+    }
+}
+
+/// Light markdown (bold, italic, code) as an attributed string, for the History window.
+func inlineMarkdown(_ md: String, size: CGFloat, color: NSColor) -> NSAttributedString {
+    let parsed = (try? AttributedString(markdown: md, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(md)
+    let out = NSMutableAttributedString()
+    let base = NSFont.systemFont(ofSize: size)
+    for run in parsed.runs {
+        var font = base
+        if let i = run.inlinePresentationIntent {
+            if i.contains(.code) { font = .monospacedSystemFont(ofSize: size - 1, weight: .regular) }
+            else {
+                var t: NSFontDescriptor.SymbolicTraits = []
+                if i.contains(.stronglyEmphasized) { t.insert(.bold) }
+                if i.contains(.emphasized) { t.insert(.italic) }
+                if !t.isEmpty { font = NSFont(descriptor: base.fontDescriptor.withSymbolicTraits(t), size: size) ?? base }
+            }
+        }
+        out.append(NSAttributedString(string: String(parsed[run.range].characters), attributes: [.font: font, .foregroundColor: color]))
+    }
+    return out
+}
+
+func chatMarkdown(_ items: [HistoryEntry]) -> String {
+    let df = DateFormatter(); df.dateStyle = .long; df.timeStyle = .short
+    var md = "# ClaudeSniper chat\n\n_\(items.first.map { df.string(from: $0.date) } ?? "")_\n"
+    var n = 0
+    for e in items {
+        if let q = e.followUp {
+            md += "\n### ↳ \(q)\n\n\(e.answer)\n"
+        } else {
+            n += 1
+            let quoted = e.capture.components(separatedBy: "\n").map { "> " + $0 }.joined(separator: "\n")
+            md += "\n## Capture \(n) · \(e.mode)\n\n\(quoted)\n\n\(e.answer)\n"
+        }
+    }
+    return md
+}
+
+func chatHTML(_ items: [HistoryEntry]) -> String {
+    func esc(_ s: String) -> String {
+        s.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;").replacingOccurrences(of: "**", with: "")
+            .replacingOccurrences(of: "`", with: "").replacingOccurrences(of: "\n", with: "<br>")
+    }
+    var h = "<h1>ClaudeSniper chat</h1>"
+    var n = 0
+    for e in items {
+        if let q = e.followUp {
+            h += "<h3>↳ \(esc(q))</h3><div>\(esc(e.answer))</div><br>"
+        } else {
+            n += 1
+            h += "<h2>Capture \(n) · \(esc(e.mode))</h2><blockquote><i>\(esc(e.capture))</i></blockquote><div>\(esc(e.answer))</div><br>"
+        }
+    }
+    return h
+}
+
 // MARK: - Claude Code
 
 func findClaude() -> String? {
@@ -266,6 +383,98 @@ func runSync(_ exe: String, _ args: [String], stdin: String?, timeout: TimeInter
     return (p.terminationStatus, String(decoding: data, as: UTF8.self))
 }
 
+/// Runs `claude -p --output-format stream-json` and reports the answer while it's being written.
+final class StreamingRun {
+    let process = Process()
+    private var buffer = Data()
+    private(set) var text = ""
+    private(set) var result: String?
+    private(set) var isError = false
+    var other = ""
+    var onText: ((String) -> Void)?
+
+    func start(_ exe: String, _ args: [String], stdin: String, timeout: TimeInterval,
+               done: @escaping (Int32, StreamingRun) -> Void) -> Bool {
+        process.executableURL = URL(fileURLWithPath: exe)
+        process.arguments = args
+        process.environment = cleanEnv()
+        process.currentDirectoryURL = URL(fileURLWithPath: workDir)
+        let out = Pipe(), err = Pipe(), inp = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+        process.standardInput = inp
+        do { try process.run() } catch { other = error.localizedDescription; return false }
+        inp.fileHandleForWriting.write(Data(stdin.utf8))
+        try? inp.fileHandleForWriting.close()
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak self] in
+            if self?.process.isRunning == true { self?.process.terminate() }
+        }
+        var errData = Data()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global().async { errData = err.fileHandleForReading.readDataToEndOfFile(); group.leave() }
+        DispatchQueue.global(qos: .userInitiated).async {
+            while true {
+                let d = out.fileHandleForReading.availableData
+                if d.isEmpty { break }
+                self.consume(d)
+            }
+            self.consume(Data("\n".utf8))
+            self.process.waitUntilExit()
+            group.wait()
+            self.other += String(decoding: errData, as: UTF8.self)
+            let status = self.process.terminationStatus
+            DispatchQueue.main.async { done(status, self) }
+        }
+        return true
+    }
+
+    private func consume(_ d: Data) {
+        buffer.append(d)
+        while let nl = buffer.firstIndex(of: 0x0A) {
+            let line = Data(buffer[buffer.startIndex..<nl])
+            buffer.removeSubrange(buffer.startIndex...nl)
+            handle(line)
+        }
+    }
+
+    private func handle(_ line: Data) {
+        guard !line.isEmpty else { return }
+        guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+            other += String(decoding: line, as: UTF8.self) + "\n"
+            return
+        }
+        switch obj["type"] as? String {
+        case "stream_event":
+            guard let ev = obj["event"] as? [String: Any] else { return }
+            if ev["type"] as? String == "message_start" { text = "" }
+            if ev["type"] as? String == "content_block_delta", let delta = ev["delta"] as? [String: Any],
+               delta["type"] as? String == "text_delta", let t = delta["text"] as? String {
+                text += t
+                let snapshot = text
+                DispatchQueue.main.async { self.onText?(snapshot) }
+            }
+        case "result":
+            result = obj["result"] as? String
+            isError = obj["is_error"] as? Bool ?? false
+        default: break
+        }
+    }
+}
+
+// MARK: - Global shortcut to reopen the last answer (⌥⌘2, no permission needed)
+
+func registerShowLastHotkey() {
+    var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+    InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+        DispatchQueue.main.async { appDelegate?.showLast() }
+        return noErr
+    }, 1, &spec, nil, nil)
+    var ref: EventHotKeyRef?
+    RegisterEventHotKey(UInt32(kVK_ANSI_2), UInt32(cmdKey | optionKey),
+                        EventHotKeyID(signature: 0x434C534E, id: 1), GetApplicationEventTarget(), 0, &ref)
+}
+
 // MARK: - Hotkey (⌘⇧2 by default)
 
 weak var appDelegate: AppDelegate?
@@ -298,9 +507,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var pollTimer: Timer?
     var armedUntil = Date.distantPast
     var lastChange = NSPasteboard.general.changeCount
-    var running: Process?
+    var current: StreamingRun?
     var requestID = 0
     let store = ChatStore()
+    let history = HistoryStore()
+    var historyWindow: HistoryWindowController?
+    /// Session of the last answer (follow-ups continue it, even with chat memory off).
+    var lastSessionID: String?
+    struct Shown { let header: String; let preview: String; let text: String; let mode: String; let footer: String; let replace: Bool }
+    var lastShown: Shown?
+    var testMode: String?
+    var pendingFollowUp: String?
     lazy var popup = PopupController()
     var loggedIn: Bool?
     var account = ""
@@ -330,7 +547,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateIcon()
         if enabled { startMonitoring() }
         refreshAuth()
+        registerShowLastHotkey()
         if CommandLine.arguments.contains("--demo") { demo() }
+        // Testing without TextSniper: interpret what's on the clipboard, optionally in a mode,
+        // then ask a follow-up. e.g. --interpret-clipboard --mode fix --follow-up "Why?"
+        let a = CommandLine.arguments
+        func value(_ k: String) -> String? { a.firstIndex(of: k).flatMap { $0 + 1 < a.count ? a[$0 + 1] : nil } }
+        if let path = value("--export-md-to"), let last = history.entries.last {   // test the Markdown export
+            try? chatMarkdown(history.chat(last.chatID)).write(toFile: path, atomically: true, encoding: .utf8)
+        }
+        if a.contains("--demo-history") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.openHistory() } }
+        if a.contains("--interpret-clipboard") {
+            testMode = value("--mode")
+            pendingFollowUp = value("--follow-up")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.handleClipboard() }
+        }
         if CommandLine.arguments.contains("--demo-settings") {   // shows the Settings submenu on its own
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                 let m = self.settingsItem().submenu!
@@ -385,6 +616,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(viewItem(segmentView(title: "MODEL", opts: models, selected: model, action: #selector(modelChanged(_:)))))
         menu.addItem(viewItem(segmentView(title: "EFFORT", opts: efforts, selected: effort, action: #selector(effortChanged(_:)))))
         menu.addItem(viewItem(modeView()))
+        menu.addItem(myModesItem())
         let langItem = item("Answer in: \(isDemo ? "English" : label(languages, answerLanguage))", "globe", nil)
         let langMenu = NSMenu()
         for l in languages {
@@ -431,6 +663,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         switchItem.submenu = sub
         menu.addItem(switchItem)
+        let last = item("Show last answer", "arrow.counterclockwise", #selector(showLast))
+        last.keyEquivalent = "2"
+        last.keyEquivalentModifierMask = [.option, .command]
+        menu.addItem(last)
+        let exportItem = item("Export chat", "square.and.arrow.up", nil)
+        let em = NSMenu()
+        em.addItem(item("As a Markdown file…", "doc.text", #selector(exportCurrentMarkdown)))
+        em.addItem(item("To Apple Notes", "note.text", #selector(exportCurrentNotes)))
+        exportItem.submenu = em
+        menu.addItem(exportItem)
+        menu.addItem(item("History…", "clock.arrow.circlepath", #selector(openHistory)))
         menu.addItem(.separator())
 
         // Status
@@ -540,13 +783,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         l.frame = NSRect(x: 14, y: 34, width: menuWidth - 28, height: 14)
         modeTitle = l
         setModeTitle()
-        let seg = NSSegmentedControl(images: modes.map { NSImage(systemSymbolName: $0.symbol, accessibilityDescription: $0.label)! },
+        let seg = NSSegmentedControl(images: builtInModes.map { NSImage(systemSymbolName: $0.symbol, accessibilityDescription: $0.label)! },
                                      trackingMode: .selectOne, target: self, action: #selector(modeChanged(_:)))
         seg.segmentDistribution = .fillEqually
-        seg.selectedSegment = modes.firstIndex { $0.id == defaultMode } ?? 0
+        seg.selectedSegment = builtInModes.firstIndex { $0.id == defaultMode } ?? -1
         seg.frame = NSRect(x: 12, y: 6, width: menuWidth - 24, height: 24)
         if #available(macOS 14.0, *) { seg.selectedSegmentBezelColor = claudeOrange }
-        for (i, m) in modes.enumerated() { seg.setToolTip("\(m.label) — key \(i + 1) in the pop-up", forSegment: i) }
+        for (i, m) in builtInModes.enumerated() { seg.setToolTip("\(m.label) — key \(i + 1) in the pop-up", forSegment: i) }
         v.addSubview(l); v.addSubview(seg)
         return v
     }
@@ -560,8 +803,134 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func modeChanged(_ s: NSSegmentedControl) {
-        defaults.set(modes[s.selectedSegment].id, forKey: "mode")
+        defaults.set(builtInModes[s.selectedSegment].id, forKey: "mode")
         setModeTitle()
+    }
+
+    // MARK: Your own modes
+
+    func myModesItem() -> NSMenuItem {
+        let it = item("My modes", "star", nil)
+        let m = NSMenu()
+        for (i, c) in customModes.enumerated() {
+            let o = NSMenuItem(title: "\(c.name)   ·   key \(builtInModes.count + i + 1)", action: #selector(useCustomMode(_:)), keyEquivalent: "")
+            o.target = self
+            o.representedObject = "custom:" + c.name
+            o.state = defaultMode == "custom:" + c.name ? .on : .off
+            o.toolTip = c.instruction
+            m.addItem(o)
+        }
+        if !customModes.isEmpty { m.addItem(.separator()) }
+        if customModes.count < 3 {
+            m.addItem(item("New mode…", "plus", #selector(newCustomMode)))
+        } else {
+            let full = NSMenuItem(title: "You have 3 modes (the maximum)", action: nil, keyEquivalent: "")
+            m.addItem(full)
+        }
+        if !customModes.isEmpty {
+            let del = item("Delete a mode", "trash", nil)
+            let dm = NSMenu()
+            for c in customModes {
+                let o = NSMenuItem(title: c.name, action: #selector(deleteCustomMode(_:)), keyEquivalent: "")
+                o.target = self
+                o.representedObject = c.name
+                dm.addItem(o)
+            }
+            del.submenu = dm
+            m.addItem(del)
+        }
+        it.submenu = m
+        return it
+    }
+
+    @objc func useCustomMode(_ i: NSMenuItem) { defaults.set(i.representedObject as? String, forKey: "mode") }
+
+    @objc func deleteCustomMode(_ i: NSMenuItem) {
+        guard let n = i.representedObject as? String else { return }
+        customModes.removeAll { $0.name == n }
+        if defaultMode == "custom:" + n { defaults.set("auto", forKey: "mode") }
+        if popup.mode == "custom:" + n { popup.mode = "auto" }
+        popup.refreshModeBar()
+    }
+
+    @objc func newCustomMode() {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "New mode"
+        a.informativeText = "Give it a short name and tell Claude what to do with each capture."
+        let name = NSTextField(frame: NSRect(x: 0, y: 96, width: 340, height: 24))
+        name.placeholderString = "Name, e.g. Flashcards"
+        let instr = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 88))
+        instr.placeholderString = "Instruction, e.g. Turn it into 3 question-and-answer flashcards."
+        instr.cell?.wraps = true
+        instr.cell?.isScrollable = false
+        let v = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 120))
+        v.addSubview(name); v.addSubview(instr)
+        a.accessoryView = v
+        a.addButton(withTitle: "Add")
+        a.addButton(withTitle: "Cancel")
+        a.window.initialFirstResponder = name
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        let n = String(name.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).prefix(18))
+        let s = instr.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !n.isEmpty, !s.isEmpty, !customModes.contains(where: { $0.name == n }), customModes.count < 3 else { NSSound.beep(); return }
+        customModes.append(CustomMode(name: n, instruction: s))
+        popup.refreshModeBar()
+    }
+
+    // MARK: Last answer, history and export
+
+    @objc func showLast() {
+        guard let s = lastShown else { NSSound.beep(); return }
+        popup.mode = s.mode
+        popup.allowReplace = s.replace
+        popup.show(header: s.header, preview: s.preview, state: .result(s.text), footer: s.footer)
+    }
+
+    @objc func openHistory() {
+        if historyWindow == nil { historyWindow = HistoryWindowController(store: history) }
+        historyWindow?.show()
+    }
+
+    var currentChatID: String? { store.activeID ?? lastSessionID }
+    @objc func exportCurrentMarkdown() { if let id = currentChatID { exportMarkdown(chatID: id) } else { NSSound.beep() } }
+    @objc func exportCurrentNotes() { if let id = currentChatID { exportNotes(chatID: id) } else { NSSound.beep() } }
+
+    func exportMarkdown(chatID: String) {
+        let items = history.chat(chatID)
+        guard !items.isEmpty else { alert("Nothing to export yet", "This chat has no saved answers."); return }
+        NSApp.activate(ignoringOtherApps: true)
+        let p = NSSavePanel()
+        p.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd HH.mm"
+        p.nameFieldStringValue = "ClaudeSniper chat \(df.string(from: items[0].date)).md"
+        guard p.runModal() == .OK, let u = p.url else { return }
+        do {
+            try chatMarkdown(items).write(to: u, atomically: true, encoding: .utf8)
+            NSWorkspace.shared.activateFileViewerSelecting([u])
+        } catch { alert("Couldn't save the file", error.localizedDescription) }
+    }
+
+    func exportNotes(chatID: String) {
+        let items = history.chat(chatID)
+        guard !items.isEmpty else { alert("Nothing to export yet", "This chat has no saved answers."); return }
+        let html = chatHTML(items).replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        var err: NSDictionary?
+        NSAppleScript(source: "tell application \"Notes\" to make new note with properties {body:\"\(html)\"}")?.executeAndReturnError(&err)
+        if let err {
+            alert("Couldn't export to Notes",
+                  "\(err[NSAppleScript.errorMessage] ?? "Unknown error")\n\nAllow ClaudeSniper to control Notes in System Settings → Privacy & Security → Automation.")
+        } else {
+            NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Notes.app"))
+        }
+    }
+
+    func alert(_ title: String, _ message: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = message
+        a.runModal()
     }
 
     // MARK: Settings menu
@@ -604,6 +973,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.addItem(.separator())
         m.addItem(toggle("Copy the answer automatically", "doc.on.clipboard", key: "autoCopy"))
         m.addItem(toggle("Play a sound when the answer arrives", "speaker.wave.2", key: "sound"))
+        if AXIsProcessTrusted() {
+            let ap = NSMenuItem(title: "Auto-paste for Replace is on", action: nil, keyEquivalent: "")
+            ap.image = NSImage(systemSymbolName: "checkmark.circle", accessibilityDescription: nil)
+            m.addItem(ap)
+        } else {
+            m.addItem(item("Allow auto-paste for Replace…", "arrow.down.doc", #selector(allowAutoPaste)))
+        }
         let li = item("Open at login", "power", #selector(toggleLoginItem))
         li.state = SMAppService.mainApp.status == .enabled ? .on : .off
         m.addItem(li)
@@ -620,6 +996,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func choicePicked(_ i: NSMenuItem) { if let c = i.representedObject as? Choice { defaults.set(c.value, forKey: c.key) } }
     @objc func togglePicked(_ i: NSMenuItem) { if let k = i.representedObject as? String { defaults.set(!defaults.bool(forKey: k), forKey: k) } }
     @objc func clearChats() { store.clearAll() }
+    @objc func allowAutoPaste() {
+        _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
+    }
 
     var recorder: KeyPanel?
     var recorderMonitor: Any?
@@ -812,7 +1191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             popup.show(header: header(), preview: "", state: .error("The clipboard is empty."), footer: chatFooter())
             return
         }
-        run(lastCapture!, modeID: defaultMode, again: false)
+        run(lastCapture!, modeID: testMode ?? defaultMode, again: false)
     }
 
     /// Sends a capture with a mode. `again` = the same capture re-run from the pop-up.
@@ -836,59 +1215,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func header() -> String { "\(label(models, model)) · \(label(efforts, effort).lowercased())" }
 
-    func ask(prompt: String, image: Bool, preview: String) {
+    func ask(prompt: String, image: Bool, preview: String, followUp: String? = nil) {
         guard let claude = findClaude() else {
             popup.show(header: header(), preview: preview, state: .error("Claude Code wasn't found. Install it with:\ncurl -fsSL https://claude.ai/install.sh | bash"), footer: "")
             return
         }
-        running?.terminate()
+        current?.process.terminate()
         requestID += 1
         let myID = requestID
         let hdr = header()
+        let modeLabel = mode(popup.mode).label
+        let captureText = lastCapture?.text ?? "[image]"
+        popup.allowReplace = followUp == nil
 
+        // A follow-up always continues the conversation of the last answer.
         let existing = store.active
-        let sessionID = existing?.id ?? UUID().uuidString.lowercased()
+        let resumeID = followUp != nil ? lastSessionID : existing?.id
+        let sessionID = resumeID ?? UUID().uuidString.lowercased()
         let activeAtStart = store.activeID
         let title = preview.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
 
         popup.show(header: hdr, preview: preview, state: .loading,
-                   footer: existing.map { "Chat · \($0.count) capture\($0.count == 1 ? "" : "s") · continuing" } ?? "Starting a new chat…")
+                   footer: followUp != nil ? "Follow-up · same chat"
+                       : existing.map { "Chat · \($0.count) capture\($0.count == 1 ? "" : "s") · continuing" } ?? "Starting a new chat…")
 
-        var args = ["-p", "--model", model, "--effort", effort, "--output-format", "text",
+        var args = ["-p", "--model", model, "--effort", effort,
+                    "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+                    "--strict-mcp-config",  // skip your MCP servers: faster start
                     "--system-prompt", systemPrompt(language: answerLanguageName(answerLanguage), length: Settings.answerLength)]
-        args += existing == nil ? ["--session-id", sessionID] : ["--resume", sessionID]
+        args += resumeID == nil ? ["--session-id", sessionID] : ["--resume", sessionID]
         args += image ? ["--tools", "Read", "--allowedTools", "Read", "--add-dir", workDir] : ["--tools", ""]
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            let r = runSync(claude, args, stdin: prompt, timeout: 300) { p in
-                DispatchQueue.main.async { self.running = p }
-            }
-            DispatchQueue.main.async {
-                guard myID == self.requestID else { return }
-                self.running = nil
-                let text = r.output.trimmingCharacters(in: .whitespacesAndNewlines)
-                if r.status == 0 && !text.isEmpty {
-                    // If the user switched or reset the chat while waiting, don't override that.
-                    self.store.record(id: sessionID, title: String(title.prefix(60)),
-                                      makeActive: self.store.activeID == activeAtStart)
-                    self.popup.show(header: hdr, preview: preview, state: .result(text), footer: self.chatFooter())
-                    if Settings.autoCopy {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(text, forType: .string)
-                        self.lastChange = NSPasteboard.general.changeCount  // don't treat this as a capture
-                    }
-                    if Settings.sound { NSSound(named: "Pop")?.play() }
-                } else if existing != nil && text.localizedCaseInsensitiveContains("no conversation found") {
-                    self.store.newChat()
-                    self.ask(prompt: prompt, image: image, preview: preview)  // retry in a new chat
-                } else if text.contains("authenticate") || text.contains("/login") || text.contains("401") {
-                    self.loggedIn = false
-                    self.popup.show(header: hdr, preview: preview, state: .error("You're not signed in to Claude Code.\nOpen the menu bar menu → “Sign in to Claude…”."), footer: "")
-                } else {
-                    self.popup.show(header: hdr, preview: preview, state: .error(text.isEmpty ? "Unknown error (code \(r.status))." : text), footer: self.chatFooter())
+        let run = StreamingRun()
+        current = run
+        run.onText = { [weak self] t in
+            guard let self, myID == self.requestID, !t.isEmpty else { return }
+            self.popup.show(header: hdr, preview: preview, state: .streaming(t), footer: "Writing…")
+        }
+        let started = run.start(claude, args, stdin: prompt, timeout: 300) { status, r in
+            guard myID == self.requestID else { return }
+            self.current = nil
+            let text = (r.result ?? r.text).trimmingCharacters(in: .whitespacesAndNewlines)
+            let errText = r.other.trimmingCharacters(in: .whitespacesAndNewlines)
+            if status == 0 && !r.isError && !text.isEmpty {
+                self.lastSessionID = sessionID
+                // If the user switched or reset the chat while waiting, don't override that.
+                self.store.record(id: sessionID, title: String(title.prefix(60)),
+                                  makeActive: self.store.activeID == activeAtStart)
+                self.history.add(HistoryEntry(chatID: sessionID, mode: modeLabel, model: hdr,
+                                              capture: captureText, followUp: followUp, answer: text))
+                let footer = self.chatFooter()
+                self.popup.show(header: hdr, preview: preview, state: .result(text), footer: footer)
+                self.lastShown = Shown(header: hdr, preview: preview, text: text, mode: self.popup.mode, footer: footer, replace: followUp == nil)
+                if Settings.autoCopy {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(text, forType: .string)
+                    self.lastChange = NSPasteboard.general.changeCount  // don't treat this as a capture
                 }
+                if Settings.sound { NSSound(named: "Pop")?.play() }
+                if let q = self.pendingFollowUp {
+                    self.pendingFollowUp = nil
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.followUp(q) }
+                }
+                return
+            }
+            let all = text + "\n" + errText
+            if resumeID != nil && all.localizedCaseInsensitiveContains("no conversation found") {
+                if followUp == nil { self.store.newChat() } else { self.lastSessionID = nil }
+                self.ask(prompt: prompt, image: image, preview: preview, followUp: followUp)  // retry in a new chat
+            } else if all.contains("authenticate") || all.contains("/login") || all.contains("401") {
+                self.loggedIn = false
+                self.popup.show(header: hdr, preview: preview, state: .error("You're not signed in to Claude Code.\nOpen the menu bar menu → “Sign in to Claude…”."), footer: "")
+            } else {
+                let msg = !text.isEmpty ? text : !errText.isEmpty ? errText : "Unknown error (code \(status))."
+                self.popup.show(header: hdr, preview: preview, state: .error(msg), footer: self.chatFooter())
             }
         }
+        if !started {
+            popup.show(header: hdr, preview: preview, state: .error("Couldn't start Claude Code: \(run.other)"), footer: "")
+        }
+    }
+
+    /// A question about the last answer, typed in the pop-up (tab).
+    func followUp(_ q: String) {
+        let prompt = "Follow-up question about the previous capture. Answer it directly, with the same language and style rules:\n\n\(q)"
+        ask(prompt: prompt, image: false, preview: "↳ " + q, followUp: q)
     }
 }
 
@@ -901,10 +1312,21 @@ final class KeyPanel: NSPanel {
 
 final class FlippedView: NSView { override var isFlipped: Bool { true } }
 
-final class PopupController: NSObject {
-    enum State { case loading, result(String), error(String) }
+/// Presses ⌘V in the front app (needs Accessibility permission).
+func pasteKeystroke() {
+    let src = CGEventSource(stateID: .combinedSessionState)
+    let down = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: true)
+    let up = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: false)
+    down?.flags = .maskCommand
+    up?.flags = .maskCommand
+    down?.post(tap: .cghidEventTap)
+    up?.post(tap: .cghidEventTap)
+}
 
-    let width: CGFloat = 530
+final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
+    enum State { case loading, streaming(String), result(String), error(String) }
+
+    let width: CGFloat = 600
     let panel: KeyPanel
     let clawdView = NSImageView()
     let titleLabel = NSTextField(labelWithString: "Claude")
@@ -915,25 +1337,35 @@ final class PopupController: NSObject {
     let scroll = NSScrollView()
     let textView = NSTextView()
     let footerLabel = NSTextField(labelWithString: "")
-    let hintLabel = NSTextField(labelWithString: "1–6 switch mode · esc close")
+    let hintLabel = NSTextField(labelWithString: "1–6 modes · tab ask · esc close")
+    let askField = NSTextField()
     var copyBtn: NSButton!
     var newBtn: NSButton!
+    var replaceBtn: NSButton!
+    var speakBtn: NSButton!
+    var askBtn: NSButton!
     let frames = Pixel.clawdFrames(px: 2)
     let idleImage = Pixel.clawd(px: 2)
     var frameIdx = 0
     var animTimer: Timer?
     var dots = 0
+    var streamingNow = false
     var resultText = ""
     var keyMonitor: Any?
     let modeBar = NSStackView()
     var modeButtons: [NSButton] = []
+    var customPill: NSButton!
     var mode = "auto" { didSet { refreshModeBar() } }
+    /// False for follow-up answers: Replace would paste an explanation, not the fixed text.
+    var allowReplace = true
+    let speech = AVSpeechSynthesizer()
 
     override init() {
-        panel = KeyPanel(contentRect: NSRect(x: 0, y: 0, width: 530, height: 220),
+        panel = KeyPanel(contentRect: NSRect(x: 0, y: 0, width: 600, height: 220),
                          styleMask: [.borderless, .nonactivatingPanel],
                          backing: .buffered, defer: false)
         super.init()
+        speech.delegate = self
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
@@ -969,9 +1401,15 @@ final class PopupController: NSObject {
         chip.layer?.backgroundColor = claudeOrange.withAlphaComponent(0.16).cgColor
         chip.layer?.cornerRadius = 8
 
+        replaceBtn = iconButton("text.insert", "Replace: paste this where you captured it", #selector(replaceResult))
+        speakBtn = iconButton("speaker.wave.2", "Read aloud", #selector(speak))
+        askBtn = iconButton("text.bubble", "Ask a follow-up (tab)", #selector(showAsk))
         copyBtn = iconButton("doc.on.doc", "Copy answer", #selector(copyResult))
         newBtn = iconButton("square.and.pencil", "New chat", #selector(newChat))
         let closeBtn = iconButton("xmark", "Close (esc)", #selector(close))
+        let buttons = NSStackView(views: [replaceBtn, speakBtn, askBtn, copyBtn, newBtn, closeBtn])
+        buttons.orientation = .horizontal
+        buttons.spacing = 2
 
         quoteBox.wantsLayer = true
         quoteBox.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.06).cgColor
@@ -1004,33 +1442,33 @@ final class PopupController: NSObject {
         hintLabel.font = .systemFont(ofSize: 10.5)
         hintLabel.textColor = NSColor.white.withAlphaComponent(0.3)
 
+        askField.placeholderString = "Ask a follow-up…   ↩ send · esc cancel"
+        askField.font = .systemFont(ofSize: 12.5)
+        askField.bezelStyle = .roundedBezel
+        askField.focusRingType = .none
+        askField.isHidden = true
+        askField.target = self
+        askField.action = #selector(askSubmitted)
+
         let divider = NSBox(); divider.boxType = .separator
 
         modeBar.orientation = .horizontal
         modeBar.spacing = 4
         modeBar.alignment = .centerY
-        for (i, m) in modes.enumerated() {
-            let b = NSButton(title: m.label, image: NSImage(systemSymbolName: m.symbol, accessibilityDescription: m.label)!,
-                             target: self, action: #selector(modeClicked(_:)))
+        for (i, m) in builtInModes.enumerated() {
+            let b = pill(m.label, m.symbol, #selector(modeClicked(_:)))
             b.tag = i
-            b.isBordered = false
-            b.imagePosition = .imageLeading
-            b.imageHugsTitle = true
-            b.font = .systemFont(ofSize: 11, weight: .medium)
-            b.symbolConfiguration = .init(pointSize: 10, weight: .semibold)
-            b.wantsLayer = true
-            b.layer?.cornerRadius = 11
             b.toolTip = "\(m.label) (key \(i + 1)): re-run this capture in this mode"
-            b.translatesAutoresizingMaskIntoConstraints = false
-            b.heightAnchor.constraint(equalToConstant: 22).isActive = true
-            b.widthAnchor.constraint(equalToConstant: b.intrinsicContentSize.width + 12).isActive = true
             modeButtons.append(b)
             modeBar.addArrangedSubview(b)
         }
+        customPill = pill("My modes", "star", #selector(customPillClicked(_:)))
+        customPill.toolTip = "Your own modes (keys 7–9)"
+        modeBar.addArrangedSubview(customPill)
         refreshModeBar()
 
-        let all: [NSView] = [border, clawdView, titleLabel, chip, copyBtn, newBtn, closeBtn,
-                             quoteBox, modeBar, scroll, divider, footerLabel, hintLabel]
+        let all: [NSView] = [border, clawdView, titleLabel, chip, buttons,
+                             quoteBox, modeBar, scroll, divider, footerLabel, hintLabel, askField]
         for v in all { v.translatesAutoresizingMaskIntoConstraints = false; bg.addSubview(v) }
         for v in [quoteBar, quoteLabel] { v.translatesAutoresizingMaskIntoConstraints = false; quoteBox.addSubview(v) }
 
@@ -1050,12 +1488,8 @@ final class PopupController: NSObject {
             chip.centerYAnchor.constraint(equalTo: clawdView.centerYAnchor),
             chip.heightAnchor.constraint(equalToConstant: 17),
 
-            closeBtn.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -12),
-            closeBtn.centerYAnchor.constraint(equalTo: clawdView.centerYAnchor),
-            newBtn.trailingAnchor.constraint(equalTo: closeBtn.leadingAnchor, constant: -2),
-            newBtn.centerYAnchor.constraint(equalTo: clawdView.centerYAnchor),
-            copyBtn.trailingAnchor.constraint(equalTo: newBtn.leadingAnchor, constant: -2),
-            copyBtn.centerYAnchor.constraint(equalTo: clawdView.centerYAnchor),
+            buttons.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -12),
+            buttons.centerYAnchor.constraint(equalTo: clawdView.centerYAnchor),
 
             quoteBox.topAnchor.constraint(equalTo: clawdView.bottomAnchor, constant: 14),
             quoteBox.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 16),
@@ -1084,11 +1518,18 @@ final class PopupController: NSObject {
             footerLabel.bottomAnchor.constraint(equalTo: bg.bottomAnchor, constant: -11),
             hintLabel.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -16),
             hintLabel.centerYAnchor.constraint(equalTo: footerLabel.centerYAnchor),
+            askField.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 14),
+            askField.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -14),
+            askField.centerYAnchor.constraint(equalTo: footerLabel.centerYAnchor),
         ])
 
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard let self, self.panel.isKeyWindow else { return e }
-            if e.keyCode == UInt16(kVK_Escape) { self.close(); return nil }
+            let asking = !self.askField.isHidden
+            if e.keyCode == UInt16(kVK_Escape) { asking ? self.hideAsk() : self.close(); return nil }
+            if asking { return e }
+            if e.keyCode == UInt16(kVK_Tab) && !self.resultText.isEmpty && !self.streamingNow { self.showAsk(); return nil }
+            let modes = allModes()
             if e.modifierFlags.intersection([.command, .control, .option]).isEmpty,
                let ch = e.charactersIgnoringModifiers, let n = Int(ch), (1...modes.count).contains(n) {
                 appDelegate?.rerun(modeID: modes[n - 1].id); return nil
@@ -1097,20 +1538,55 @@ final class PopupController: NSObject {
         }
     }
 
-    func refreshModeBar() {
-        for (i, b) in modeButtons.enumerated() {
-            let on = modes[i].id == mode
-            b.layer?.backgroundColor = (on ? claudeOrange.withAlphaComponent(0.25) : NSColor.white.withAlphaComponent(0.06)).cgColor
-            b.layer?.borderWidth = on ? 1 : 0
-            b.layer?.borderColor = claudeOrange.withAlphaComponent(0.6).cgColor
-            b.contentTintColor = on ? claudeOrange : NSColor.white.withAlphaComponent(0.7)
-            b.attributedTitle = NSAttributedString(string: " " + modes[i].label, attributes: [
-                .font: NSFont.systemFont(ofSize: 11, weight: on ? .semibold : .medium),
-                .foregroundColor: on ? claudeOrange : NSColor.white.withAlphaComponent(0.7)])
-        }
+    func pill(_ title: String, _ symbol: String, _ action: Selector) -> NSButton {
+        let b = NSButton(title: title, image: NSImage(systemSymbolName: symbol, accessibilityDescription: title)!,
+                         target: self, action: action)
+        b.isBordered = false
+        b.imagePosition = .imageLeading
+        b.imageHugsTitle = true
+        b.font = .systemFont(ofSize: 11, weight: .medium)
+        b.symbolConfiguration = .init(pointSize: 10, weight: .semibold)
+        b.wantsLayer = true
+        b.layer?.cornerRadius = 11
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        return b
     }
 
-    @objc func modeClicked(_ b: NSButton) { appDelegate?.rerun(modeID: modes[b.tag].id) }
+    func style(_ b: NSButton, _ title: String, on: Bool) {
+        b.layer?.backgroundColor = (on ? claudeOrange.withAlphaComponent(0.25) : NSColor.white.withAlphaComponent(0.06)).cgColor
+        b.layer?.borderWidth = on ? 1 : 0
+        b.layer?.borderColor = claudeOrange.withAlphaComponent(0.6).cgColor
+        b.contentTintColor = on ? claudeOrange : NSColor.white.withAlphaComponent(0.7)
+        b.attributedTitle = NSAttributedString(string: " " + title, attributes: [
+            .font: NSFont.systemFont(ofSize: 11, weight: on ? .semibold : .medium),
+            .foregroundColor: on ? claudeOrange : NSColor.white.withAlphaComponent(0.7)])
+        b.constraints.filter { $0.firstAttribute == .width }.forEach { b.removeConstraint($0) }
+        b.widthAnchor.constraint(equalToConstant: b.intrinsicContentSize.width + 12).isActive = true
+    }
+
+    func refreshModeBar() {
+        for (i, b) in modeButtons.enumerated() { style(b, builtInModes[i].label, on: builtInModes[i].id == mode) }
+        let custom = customModes
+        customPill.isHidden = custom.isEmpty
+        let isCustom = mode.hasPrefix("custom:")
+        style(customPill, isCustom ? String(mode.dropFirst(7)) + " ▾" : "My modes ▾", on: isCustom)
+    }
+
+    @objc func modeClicked(_ b: NSButton) { appDelegate?.rerun(modeID: builtInModes[b.tag].id) }
+
+    @objc func customPillClicked(_ b: NSButton) {
+        let m = NSMenu()
+        for (i, c) in customModes.enumerated() {
+            let it = NSMenuItem(title: "\(c.name)   key \(builtInModes.count + i + 1)", action: #selector(customChosen(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = "custom:" + c.name
+            it.state = mode == "custom:" + c.name ? .on : .off
+            m.addItem(it)
+        }
+        m.popUp(positioning: nil, at: NSPoint(x: 0, y: b.bounds.height + 4), in: b)
+    }
+    @objc func customChosen(_ i: NSMenuItem) { if let id = i.representedObject as? String { appDelegate?.rerun(modeID: id) } }
 
     static func roundedMask(_ r: CGFloat) -> NSImage {
         let img = NSImage(size: NSSize(width: 2 * r + 1, height: 2 * r + 1), flipped: false) { rect in
@@ -1135,28 +1611,50 @@ final class PopupController: NSObject {
         return b
     }
 
+    func setAnswerButtons(visible: Bool) {
+        copyBtn.isHidden = !visible
+        speakBtn.isHidden = !visible
+        askBtn.isHidden = !visible
+        replaceBtn.isHidden = !(visible && allowReplace && replaceableModes.contains(mode))
+    }
+
     func show(header: String, preview: String, state: State, footer: String) {
         chip.stringValue = "  \(header)  "
         let pv = preview.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
         quoteLabel.stringValue = pv.isEmpty ? "—" : pv
         footerLabel.stringValue = footer
         newBtn.contentTintColor = NSColor.white.withAlphaComponent(0.6)
+        var streaming = false
 
         switch state {
         case .loading:
             closeWork?.cancel()
-            copyBtn.isHidden = true
+            stopSpeaking()
+            hideAsk()
+            setAnswerButtons(visible: false)
             resultText = ""
+            streamingNow = false
             startAnimating()
+        case .streaming(let t):
+            streaming = true
+            if !streamingNow { streamingNow = true; if animTimer == nil { startAnimating() } }
+            setAnswerButtons(visible: false)
+            resultText = t
+            let s = NSMutableAttributedString(attributedString: renderMarkdown(t))
+            s.append(NSAttributedString(string: " ▍", attributes: [.font: NSFont.systemFont(ofSize: 14), .foregroundColor: claudeOrange]))
+            textView.textStorage?.setAttributedString(s)
         case .result(let t):
+            streamingNow = false
             stopAnimating()
             scheduleAutoClose(isDemo ? 0 : Settings.autoClose)
-            copyBtn.isHidden = false
             resultText = t
+            setAnswerButtons(visible: true)
             textView.textStorage?.setAttributedString(renderMarkdown(t))
         case .error(let t):
+            streamingNow = false
             stopAnimating()
-            copyBtn.isHidden = true
+            setAnswerButtons(visible: false)
+            resultText = ""
             textView.textStorage?.setAttributedString(NSAttributedString(string: t,
                 attributes: [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.systemRed.blended(withFraction: 0.3, of: .white)!]))
         }
@@ -1170,20 +1668,22 @@ final class PopupController: NSObject {
         let chrome: CGFloat = 14 + 24 + 14 + quoteH + 10 + 22 + 12 + 10 + 1 + 9 + 13 + 11
         let height = min(max(used + chrome + 4, 170), 620)
 
-        if !panel.isVisible || isDemo {
+        if !panel.isVisible || (isDemo && !streaming) {
             positionNearMouse(height: height)
             panel.alphaValue = 0
             panel.orderFrontRegardless()
             NSAnimationContext.runAnimationGroup { $0.duration = 0.18; panel.animator().alphaValue = 1 }
-        } else {
+        } else if abs(panel.frame.height - height) > 0.5 {
             var f = panel.frame
             f.origin.y += f.height - height
             f.size.height = height
-            panel.setFrame(f, display: true, animate: true)
+            panel.setFrame(f, display: true, animate: !streaming)
+            panel.orderFrontRegardless()
+        } else {
             panel.orderFrontRegardless()
         }
         panel.makeKey()
-        scroll.contentView.scroll(to: .zero)
+        if streaming { textView.scrollToEndOfDocument(nil) } else { scroll.contentView.scroll(to: .zero) }
     }
 
     func startAnimating() {
@@ -1193,9 +1693,9 @@ final class PopupController: NSObject {
             guard let self else { return }
             self.frameIdx = (self.frameIdx + 1) % self.frames.count
             self.clawdView.image = self.frames[self.frameIdx]
-            if self.frameIdx % 2 == 0 { self.dots = (self.dots + 1) % 4; self.setThinking() }
+            if self.frameIdx % 2 == 0 && !self.streamingNow { self.dots = (self.dots + 1) % 4; self.setThinking() }
         }
-        setThinking()
+        if !streamingNow { setThinking() }
     }
     func setThinking() {
         textView.textStorage?.setAttributedString(NSAttributedString(string: "Thinking" + String(repeating: ".", count: dots),
@@ -1254,19 +1754,23 @@ final class PopupController: NSObject {
 
     var closeWork: DispatchWorkItem?
 
-    /// Closes the pop-up after `seconds`, but waits while the mouse is over it.
+    /// Closes the pop-up after `seconds`, but waits while the mouse is over it or you're typing.
     func scheduleAutoClose(_ seconds: Int) {
         closeWork?.cancel()
         guard seconds > 0 else { return }
         let w = DispatchWorkItem { [weak self] in
             guard let self, self.panel.isVisible else { return }
-            if NSMouseInRect(NSEvent.mouseLocation, self.panel.frame, false) { self.scheduleAutoClose(3) } else { self.close() }
+            if NSMouseInRect(NSEvent.mouseLocation, self.panel.frame, false) || !self.askField.isHidden || self.speech.isSpeaking {
+                self.scheduleAutoClose(3)
+            } else { self.close() }
         }
         closeWork = w
         DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(seconds), execute: w)
     }
 
     @objc func close() {
+        stopSpeaking()
+        hideAsk()
         NSAnimationContext.runAnimationGroup({ $0.duration = 0.12; panel.animator().alphaValue = 0 },
                                              completionHandler: { self.panel.orderOut(nil); self.panel.alphaValue = 1 })
     }
@@ -1279,6 +1783,74 @@ final class PopupController: NSObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { self.copyBtn.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil) }
     }
 
+    /// Fix / Translate: put the corrected or translated text back where it came from.
+    @objc func replaceResult() {
+        let t = mainPart(resultText)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(t, forType: .string)
+        appDelegate?.lastChange = NSPasteboard.general.changeCount
+        if AXIsProcessTrusted() {
+            close()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { pasteKeystroke() }
+        } else {
+            footerLabel.stringValue = "✓ Copied · press ⌘V to paste (Settings → Allow auto-paste)"
+            flash(replaceBtn, "checkmark")
+        }
+    }
+
+    // Read aloud
+
+    @objc func speak() {
+        if speech.isSpeaking { stopSpeaking(); return }
+        let plain = resultText
+            .replacingOccurrences(of: #"(?m)^\s*-{3,}\s*$"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"[*`#>_]"#, with: "", options: .regularExpression)
+        guard !plain.isEmpty else { return }
+        let u = AVSpeechUtterance(string: plain)
+        let r = NLLanguageRecognizer()
+        r.processString(plain)
+        if let lang = r.dominantLanguage?.rawValue {
+            let voices = AVSpeechSynthesisVoice.speechVoices().filter { $0.language.hasPrefix(lang) }
+            u.voice = voices.first { $0.language == AVSpeechSynthesisVoice.currentLanguageCode() } ?? voices.first
+        }
+        speech.speak(u)
+        speakBtn.image = NSImage(systemSymbolName: "stop.fill", accessibilityDescription: "Stop")
+    }
+    func stopSpeaking() {
+        if speech.isSpeaking { speech.stopSpeaking(at: .immediate) }
+        speakBtn?.image = NSImage(systemSymbolName: "speaker.wave.2", accessibilityDescription: "Read aloud")
+    }
+    func speechSynthesizer(_ s: AVSpeechSynthesizer, didFinish u: AVSpeechUtterance) {
+        DispatchQueue.main.async { self.speakBtn.image = NSImage(systemSymbolName: "speaker.wave.2", accessibilityDescription: "Read aloud") }
+    }
+
+    // Follow-up questions
+
+    @objc func showAsk() {
+        guard !resultText.isEmpty, !streamingNow else { return }
+        closeWork?.cancel()
+        footerLabel.isHidden = true
+        hintLabel.isHidden = true
+        askField.isHidden = false
+        askField.stringValue = ""
+        panel.makeKey()
+        panel.makeFirstResponder(askField)
+    }
+    func hideAsk() {
+        guard !askField.isHidden else { return }
+        askField.isHidden = true
+        footerLabel.isHidden = false
+        hintLabel.isHidden = false
+        panel.makeFirstResponder(nil)
+    }
+    @objc func askSubmitted() {
+        guard !askField.isHidden else { return }
+        let q = askField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return }
+        hideAsk()
+        appDelegate?.followUp(q)
+    }
+
     @objc func newChat() {
         appDelegate?.store.newChat()
         footerLabel.stringValue = "✓ New chat · your next capture starts fresh"
@@ -1289,7 +1861,9 @@ final class PopupController: NSObject {
         b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
     }
 
-    func renderMarkdown(_ md: String) -> NSAttributedString {
+    func renderMarkdown(_ raw: String) -> NSAttributedString {
+        // No blank lines around a "---" divider: the line itself is the spacing.
+        let md = raw.replacingOccurrences(of: #"\n[ \t]*\n([ \t]*-{3,}[ \t]*)\n[ \t]*\n"#, with: "\n$1\n", options: .regularExpression)
         let base = NSFont.systemFont(ofSize: 14)
         let text = NSColor.white.withAlphaComponent(0.92)
         let para = NSMutableParagraphStyle(); para.paragraphSpacing = 5; para.lineSpacing = 2.5
@@ -1298,6 +1872,12 @@ final class PopupController: NSObject {
         for (i, rawLine) in lines.enumerated() {
             var line = rawLine
             var lineFont = base
+            if line.trimmingCharacters(in: .whitespaces).range(of: #"^-{3,}$"#, options: .regularExpression) != nil {
+                out.append(NSAttributedString(string: String(repeating: "─", count: 22),
+                    attributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.white.withAlphaComponent(0.2), .paragraphStyle: para]))
+                if i < lines.count - 1 { out.append(NSAttributedString(string: "\n", attributes: [.font: base, .paragraphStyle: para])) }
+                continue
+            }
             if let r = line.range(of: #"^#{1,6}\s+"#, options: .regularExpression) {
                 line.removeSubrange(r); lineFont = .systemFont(ofSize: 15, weight: .bold)
             } else if let r = line.range(of: #"^(\s*)[-*]\s+"#, options: .regularExpression) {
@@ -1334,6 +1914,161 @@ final class PopupController: NSObject {
             }
         }
         return out
+    }
+}
+
+// MARK: - History window
+
+final class HistoryWindowController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
+    let window: NSWindow
+    let table = NSTableView()
+    let search = NSSearchField()
+    let detail = NSTextView()
+    var rows: [HistoryEntry] = []
+    let store: HistoryStore
+
+    init(store: HistoryStore) {
+        self.store = store
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 860, height: 540),
+                          styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
+        super.init()
+        window.title = "ClaudeSniper History"
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 640, height: 380)
+        let content = NSView()
+        window.contentView = content
+
+        search.placeholderString = "Search captures and answers"
+        search.delegate = self
+        let col = NSTableColumn(identifier: .init("entry"))
+        col.width = 310
+        table.addTableColumn(col)
+        table.headerView = nil
+        table.rowHeight = 44
+        table.dataSource = self
+        table.delegate = self
+        let tScroll = NSScrollView()
+        tScroll.documentView = table
+        tScroll.hasVerticalScroller = true
+        tScroll.borderType = .bezelBorder
+
+        detail.isEditable = false
+        detail.textContainerInset = NSSize(width: 12, height: 12)
+        detail.isVerticallyResizable = true
+        detail.autoresizingMask = [.width]
+        detail.textContainer?.widthTracksTextView = true
+        let dScroll = NSScrollView()
+        dScroll.documentView = detail
+        dScroll.hasVerticalScroller = true
+        dScroll.borderType = .bezelBorder
+
+        let copy = NSButton(title: "Copy answer", target: self, action: #selector(copyAnswer))
+        let md = NSButton(title: "Export chat as Markdown…", target: self, action: #selector(exportMD))
+        let notes = NSButton(title: "Export chat to Notes", target: self, action: #selector(exportToNotes))
+        let clear = NSButton(title: "Clear history…", target: self, action: #selector(clearAll))
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let buttons = NSStackView(views: [copy, md, notes, spacer, clear])
+        buttons.orientation = .horizontal
+
+        for v in [search, tScroll, dScroll, buttons] as [NSView] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(v)
+        }
+        NSLayoutConstraint.activate([
+            search.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            search.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            search.widthAnchor.constraint(equalToConstant: 310),
+            tScroll.topAnchor.constraint(equalTo: search.bottomAnchor, constant: 8),
+            tScroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            tScroll.widthAnchor.constraint(equalToConstant: 310),
+            tScroll.bottomAnchor.constraint(equalTo: buttons.topAnchor, constant: -10),
+            dScroll.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            dScroll.leadingAnchor.constraint(equalTo: tScroll.trailingAnchor, constant: 10),
+            dScroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            dScroll.bottomAnchor.constraint(equalTo: buttons.topAnchor, constant: -10),
+            buttons.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            buttons.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            buttons.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
+        ])
+    }
+
+    func show() {
+        reload()
+        NSApp.activate(ignoringOtherApps: true)
+        if !window.isVisible { window.center() }
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    func reload() {
+        let q = search.stringValue.lowercased()
+        rows = store.entries.reversed().filter {
+            q.isEmpty || $0.capture.lowercased().contains(q) || $0.answer.lowercased().contains(q)
+                || ($0.followUp?.lowercased().contains(q) ?? false)
+        }
+        table.reloadData()
+        if rows.isEmpty {
+            detail.string = store.entries.isEmpty ? "No answers yet. Capture something with TextSniper." : "No matches."
+        } else {
+            table.selectRowIndexes([0], byExtendingSelection: false)
+            tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification))
+        }
+    }
+
+    func controlTextDidChange(_ obj: Notification) { reload() }
+    func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let e = rows[row]
+        let id = NSUserInterfaceItemIdentifier("cell")
+        let tf = (tableView.makeView(withIdentifier: id, owner: nil) as? NSTextField) ?? {
+            let t = NSTextField(labelWithString: "")
+            t.identifier = id
+            t.maximumNumberOfLines = 2
+            return t
+        }()
+        let df = DateFormatter(); df.dateStyle = .short; df.timeStyle = .short
+        var title = (e.followUp.map { "↳ " + $0 } ?? e.capture).replacingOccurrences(of: "\n", with: " ")
+        if title.count > 48 { title = String(title.prefix(47)) + "…" }
+        let s = NSMutableAttributedString(string: title + "\n", attributes: [.font: NSFont.systemFont(ofSize: 12.5)])
+        s.append(NSAttributedString(string: "\(df.string(from: e.date)) · \(e.mode)",
+                                    attributes: [.font: NSFont.systemFont(ofSize: 10.5), .foregroundColor: NSColor.secondaryLabelColor]))
+        tf.attributedStringValue = s
+        return tf
+    }
+
+    var selected: HistoryEntry? {
+        let r = table.selectedRow
+        return r >= 0 && r < rows.count ? rows[r] : nil
+    }
+
+    func tableViewSelectionDidChange(_ n: Notification) {
+        guard let e = selected else { return }
+        let df = DateFormatter(); df.dateStyle = .medium; df.timeStyle = .short
+        let s = NSMutableAttributedString()
+        s.append(NSAttributedString(string: "\(df.string(from: e.date)) · \(e.mode) · \(e.model)\n\n",
+                                    attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]))
+        s.append(NSAttributedString(string: (e.followUp.map { "↳ " + $0 } ?? e.capture) + "\n\n",
+                                    attributes: [.font: NSFont.systemFont(ofSize: 12.5), .foregroundColor: NSColor.secondaryLabelColor]))
+        s.append(inlineMarkdown(e.answer, size: 13.5, color: .labelColor))
+        detail.textStorage?.setAttributedString(s)
+    }
+
+    @objc func copyAnswer() {
+        guard let e = selected else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(e.answer, forType: .string)
+        appDelegate?.lastChange = NSPasteboard.general.changeCount
+    }
+    @objc func exportMD() { if let e = selected { appDelegate?.exportMarkdown(chatID: e.chatID) } }
+    @objc func exportToNotes() { if let e = selected { appDelegate?.exportNotes(chatID: e.chatID) } }
+    @objc func clearAll() {
+        let a = NSAlert()
+        a.messageText = "Clear all history?"
+        a.informativeText = "This deletes every saved capture and answer. Your chats in Claude Code are not affected."
+        a.addButton(withTitle: "Clear")
+        a.addButton(withTitle: "Cancel")
+        if a.runModal() == .alertFirstButtonReturn { store.clear(); reload() }
     }
 }
 

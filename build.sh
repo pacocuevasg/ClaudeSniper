@@ -22,6 +22,7 @@ cat > "$BUILD/Contents/Info.plist" <<'PLIST'
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSAppleEventsUsageDescription</key><string>ClaudeSniper exports a chat to Apple Notes when you ask it to.</string>
 </dict></plist>
 PLIST
 
