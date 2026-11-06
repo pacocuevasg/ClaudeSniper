@@ -1,8 +1,8 @@
 // ClaudeSniper — a companion for TextSniper.
 // Pixel-art menu bar icon with an on/off toggle. When it's on and you press ⌘⇧2 in
 // TextSniper, it sends the capture to Claude (through Claude Code, using your plan) and
-// shows the answer in a pop-up. Captures are grouped into a chat that expires after
-// 15 minutes without use; from the menu or the pop-up you can start a new chat or switch.
+// shows the answer in a pop-up. Captures are grouped into a chat that expires after a
+// while without use (15 min by default, see Settings); you can start a new chat or switch.
 
 import Cocoa
 import ServiceManagement
@@ -66,7 +66,36 @@ func answerLanguageName(_ id: String) -> String {
     return Locale(identifier: "en").localizedString(forLanguageCode: code) ?? "English"
 }
 
-func systemPrompt(language: String) -> String {
+// MARK: - Settings (menu bar → Settings)
+
+enum Settings {
+    /// Chat memory in minutes. 0 = off (every capture starts a new chat).
+    static var chatMinutes: Int { defaults.object(forKey: "chatMinutes") as? Int ?? 15 }
+    static var answerLength: String { defaults.string(forKey: "answerLength") ?? "normal" }
+    static var popupPosition: String { defaults.string(forKey: "popupPosition") ?? "cursor" }
+    /// Seconds before the pop-up closes by itself. 0 = never.
+    static var autoClose: Int { defaults.object(forKey: "autoClose") as? Int ?? 0 }
+    static var autoCopy: Bool { defaults.bool(forKey: "autoCopy") }
+    static var sound: Bool { defaults.bool(forKey: "sound") }
+}
+let chatMemoryOptions: [(Any, String)] = [(0, "Off · every capture is a new chat"), (5, "5 minutes"), (10, "10 minutes"),
+                                          (15, "15 minutes"), (30, "30 minutes"), (60, "1 hour")]
+let lengthOptions: [(Any, String)] = [("short", "Short"), ("normal", "Normal"), ("detailed", "Detailed")]
+let lengthHint = ["short": "under 80 words", "normal": "under 200 words", "detailed": "under 400 words; go deeper when it helps"]
+let positionOptions: [(Any, String)] = [("cursor", "Next to the cursor"), ("topRight", "Top-right corner"), ("center", "Center of the screen")]
+let autoCloseOptions: [(Any, String)] = [(0, "Never"), (15, "After 15 seconds"), (30, "After 30 seconds"), (60, "After 1 minute")]
+
+/// The capture shortcut. Defaults to TextSniper's ⌘⇧2; change it if you changed it in TextSniper.
+var hotkeyCode = defaults.object(forKey: "hotkeyCode") as? Int ?? Int(kVK_ANSI_2)
+var hotkeyMods = UInt(defaults.object(forKey: "hotkeyMods") as? Int ?? Int(NSEvent.ModifierFlags([.command, .shift]).rawValue))
+var hotkeyLabel = defaults.string(forKey: "hotkeyLabel") ?? "⌘⇧2"
+
+func chatMemoryText() -> String {
+    let m = Settings.chatMinutes
+    return m == 0 ? "off" : m >= 60 ? "\(m / 60) h" : "\(m) min"
+}
+
+func systemPrompt(language: String, length: String) -> String {
     """
     The user captures snippets of their screen with TextSniper (OCR) and sends them to you. \
     You will receive that text (or an image). Work out what it is and answer in a useful, direct way:
@@ -79,7 +108,7 @@ func systemPrompt(language: String) -> String {
     use the context of earlier captures when it helps. The text may contain OCR errors; \
     correct them silently. Don't ask follow-up questions: just give the answer. Each message \
     names a MODE with a specific instruction: follow it over the general rules. Answer in \
-    \(language) (unless the mode asks otherwise), concisely (ideally under 200 words), with \
+    \(language) (unless the mode asks otherwise), concisely (ideally \(lengthHint[length] ?? "under 200 words")), with \
     light markdown (bold, lists).
     """
 }
@@ -147,12 +176,12 @@ enum Pixel {
     }
 }
 
-// MARK: - Chats (15-minute cache)
+// MARK: - Chats (memory length is a setting)
 
 struct Chat: Codable { var id: String; var title: String; var created: Date; var lastUsed: Date; var count: Int }
 
 final class ChatStore {
-    static let ttl: TimeInterval = 15 * 60
+    static var ttl: TimeInterval { TimeInterval(Settings.chatMinutes * 60) }
     private(set) var chats: [Chat] = []
     private(set) var activeID: String?
 
@@ -172,6 +201,7 @@ final class ChatStore {
     var active: Chat? { prune(); return chats.first { $0.id == activeID } }
     var recent: [Chat] { prune(); return chats }
     func newChat() { activeID = nil; save() }
+    func clearAll() { chats = []; activeID = nil; save() }
     func switchTo(_ id: String) { activeID = id; save() }
     func record(id: String, title: String, makeActive: Bool) {
         if let i = chats.firstIndex(where: { $0.id == id }) {
@@ -236,7 +266,7 @@ func runSync(_ exe: String, _ args: [String], stdin: String?, timeout: TimeInter
     return (p.terminationStatus, String(decoding: data, as: UTF8.self))
 }
 
-// MARK: - Hotkey (⌘⇧2)
+// MARK: - Hotkey (⌘⇧2 by default)
 
 weak var appDelegate: AppDelegate?
 
@@ -248,8 +278,12 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
     if type == .keyDown {
         let code = event.getIntegerValueField(.keyboardEventKeycode)
         let f = event.flags
-        if code == Int64(kVK_ANSI_2), f.contains(.maskCommand), f.contains(.maskShift),
-           !f.contains(.maskControl), !f.contains(.maskAlternate) {
+        var m: NSEvent.ModifierFlags = []
+        if f.contains(.maskCommand) { m.insert(.command) }
+        if f.contains(.maskShift) { m.insert(.shift) }
+        if f.contains(.maskControl) { m.insert(.control) }
+        if f.contains(.maskAlternate) { m.insert(.option) }
+        if code == Int64(hotkeyCode), m.rawValue == hotkeyMods {
             DispatchQueue.main.async { appDelegate?.hotkeyPressed() }
         }
     }
@@ -297,6 +331,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if enabled { startMonitoring() }
         refreshAuth()
         if CommandLine.arguments.contains("--demo") { demo() }
+        if CommandLine.arguments.contains("--demo-settings") {   // shows the Settings submenu on its own
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                let m = self.settingsItem().submenu!
+                let p = NSScreen.main!.visibleFrame
+                m.popUp(positioning: nil, at: NSPoint(x: p.midX - 150, y: p.midY + 150), in: nil)
+            }
+        }
         if CommandLine.arguments.contains("--demo-menu") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.statusItem.button?.performClick(nil) }
         }
@@ -384,7 +425,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             sub.addItem(it)
         }
         if sub.items.isEmpty {
-            let it = NSMenuItem(title: "No recent chats (they last 15 min)", action: nil, keyEquivalent: "")
+            let it = NSMenuItem(title: Settings.chatMinutes == 0 ? "Chat memory is off (see Settings)" : "No recent chats (they last \(chatMemoryText()))", action: nil, keyEquivalent: "")
             it.isEnabled = false
             sub.addItem(it)
         }
@@ -401,15 +442,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(status(false, loggedIn == nil ? "Checking connection…" : "Sign in to Claude…", action: #selector(login)))
         }
         if CGPreflightListenEventAccess() {
-            menu.addItem(status(true, "⌘⇧2 shortcut detected", action: nil))
+            menu.addItem(status(true, "\(hotkeyLabel) shortcut detected", action: nil))
         } else {
-            menu.addItem(status(false, "Allow keyboard access (⌘⇧2)…", action: #selector(askKeyboardPermission)))
+            menu.addItem(status(false, "Allow keyboard access (\(hotkeyLabel))…", action: #selector(askKeyboardPermission)))
         }
         menu.addItem(.separator())
         menu.addItem(item("Interpret clipboard now", "wand.and.stars", #selector(testNow)))
-        let li = item("Open at login", "power", #selector(toggleLoginItem))
-        li.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        menu.addItem(li)
+        menu.addItem(settingsItem())
         menu.addItem(.separator())
         menu.addItem(item("Quit ClaudeSniper", "xmark.circle", #selector(NSApp.terminate(_:)), key: "q"))
     }
@@ -468,7 +507,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let title = NSTextField(labelWithString: "ClaudeSniper")
         title.font = .systemFont(ofSize: 14, weight: .bold)
         title.frame = NSRect(x: 62, y: 29, width: 160, height: 18)
-        let sub = NSTextField(labelWithString: enabled ? "On · press ⌘⇧2 in TextSniper" : "Off")
+        let sub = NSTextField(labelWithString: enabled ? "On · press \(hotkeyLabel) in TextSniper" : "Off")
         sub.font = .systemFont(ofSize: 11)
         sub.textColor = enabled ? claudeOrange : .secondaryLabelColor
         sub.frame = NSRect(x: 62, y: 12, width: 180, height: 15)
@@ -527,6 +566,118 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func modeChanged(_ s: NSSegmentedControl) {
         defaults.set(modes[s.selectedSegment].id, forKey: "mode")
         setModeTitle()
+    }
+
+    // MARK: Settings menu
+
+    final class Choice: NSObject { let key: String; let value: Any; init(_ k: String, _ v: Any) { key = k; value = v } }
+
+    func choiceMenu(_ title: String, _ symbol: String, key: String, options: [(Any, String)], isOn: (Any) -> Bool) -> NSMenuItem {
+        let cur = options.first { isOn($0.0) }?.1 ?? ""
+        let it = item("\(title): \(cur.components(separatedBy: " · ").first!)", symbol, nil)
+        let sub = NSMenu()
+        for (v, l) in options {
+            let o = NSMenuItem(title: l, action: #selector(choicePicked(_:)), keyEquivalent: "")
+            o.target = self
+            o.representedObject = Choice(key, v)
+            o.state = isOn(v) ? .on : .off
+            sub.addItem(o)
+        }
+        it.submenu = sub
+        return it
+    }
+
+    func toggle(_ title: String, _ symbol: String, key: String) -> NSMenuItem {
+        let it = item(title, symbol, #selector(togglePicked(_:)))
+        it.representedObject = key
+        it.state = defaults.bool(forKey: key) ? .on : .off
+        return it
+    }
+
+    func settingsItem() -> NSMenuItem {
+        let s = item("Settings", "gearshape", nil)
+        let m = NSMenu()
+        m.addItem(choiceMenu("Chat memory", "clock.arrow.circlepath", key: "chatMinutes", options: chatMemoryOptions,
+                             isOn: { ($0 as? Int) == Settings.chatMinutes }))
+        m.addItem(choiceMenu("Answer length", "text.alignleft", key: "answerLength", options: lengthOptions,
+                             isOn: { ($0 as? String) == Settings.answerLength }))
+        m.addItem(choiceMenu("Pop-up position", "macwindow", key: "popupPosition", options: positionOptions,
+                             isOn: { ($0 as? String) == Settings.popupPosition }))
+        m.addItem(choiceMenu("Close pop-up", "timer", key: "autoClose", options: autoCloseOptions,
+                             isOn: { ($0 as? Int) == Settings.autoClose }))
+        m.addItem(.separator())
+        m.addItem(toggle("Copy the answer automatically", "doc.on.clipboard", key: "autoCopy"))
+        m.addItem(toggle("Play a sound when the answer arrives", "speaker.wave.2", key: "sound"))
+        let li = item("Open at login", "power", #selector(toggleLoginItem))
+        li.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        m.addItem(li)
+        m.addItem(.separator())
+        m.addItem(item("Change capture shortcut (\(hotkeyLabel))…", "keyboard", #selector(changeShortcut)))
+        if hotkeyLabel != "⌘⇧2" { m.addItem(item("Reset shortcut to ⌘⇧2", "arrow.uturn.backward", #selector(resetShortcut))) }
+        let clear = item("Clear all chats", "trash", #selector(clearChats))
+        clear.isEnabled = !store.recent.isEmpty
+        m.addItem(clear)
+        s.submenu = m
+        return s
+    }
+
+    @objc func choicePicked(_ i: NSMenuItem) { if let c = i.representedObject as? Choice { defaults.set(c.value, forKey: c.key) } }
+    @objc func togglePicked(_ i: NSMenuItem) { if let k = i.representedObject as? String { defaults.set(!defaults.bool(forKey: k), forKey: k) } }
+    @objc func clearChats() { store.clearAll() }
+
+    var recorder: KeyPanel?
+    var recorderMonitor: Any?
+
+    /// Records a new capture shortcut: press it in the small window that opens.
+    @objc func changeShortcut() {
+        endRecording()
+        let p = KeyPanel(contentRect: NSRect(x: 0, y: 0, width: 360, height: 130), styleMask: [.titled, .closable],
+                         backing: .buffered, defer: false)
+        p.title = "Capture shortcut"
+        p.level = .floating
+        p.isReleasedWhenClosed = false
+        let l = NSTextField(wrappingLabelWithString: "Press the shortcut you use in TextSniper.\nIt needs ⌘, ⌃ or ⌥. Esc cancels.")
+        l.alignment = .center
+        l.font = .systemFont(ofSize: 13)
+        l.frame = NSRect(x: 20, y: 35, width: 320, height: 60)
+        p.contentView?.addSubview(l)
+        p.center()
+        NSApp.activate(ignoringOtherApps: true)
+        p.makeKeyAndOrderFront(nil)
+        recorder = p
+        recorderMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            guard let self, self.recorder?.isKeyWindow == true else { return e }
+            if e.keyCode == UInt16(kVK_Escape) { self.endRecording(); return nil }
+            let mods = e.modifierFlags.intersection([.command, .control, .option, .shift])
+            guard !mods.intersection([.command, .control, .option]).isEmpty else { NSSound.beep(); return nil }
+            let key = (e.characters(byApplyingModifiers: []) ?? e.charactersIgnoringModifiers ?? "?").uppercased()
+            var lbl = ""
+            if mods.contains(.control) { lbl += "⌃" }
+            if mods.contains(.option) { lbl += "⌥" }
+            if mods.contains(.shift) { lbl += "⇧" }
+            if mods.contains(.command) { lbl += "⌘" }
+            self.setShortcut(code: Int(e.keyCode), mods: mods.rawValue, label: lbl + key)
+            self.endRecording()
+            return nil
+        }
+    }
+
+    @objc func resetShortcut() {
+        setShortcut(code: Int(kVK_ANSI_2), mods: NSEvent.ModifierFlags([.command, .shift]).rawValue, label: "⌘⇧2")
+    }
+
+    func setShortcut(code: Int, mods: UInt, label: String) {
+        hotkeyCode = code; hotkeyMods = mods; hotkeyLabel = label
+        defaults.set(code, forKey: "hotkeyCode")
+        defaults.set(Int(mods), forKey: "hotkeyMods")
+        defaults.set(label, forKey: "hotkeyLabel")
+    }
+
+    func endRecording() {
+        if let m = recorderMonitor { NSEvent.removeMonitor(m) }
+        recorderMonitor = nil
+        recorder?.orderOut(nil)
+        recorder = nil
     }
 
     @objc func languageChanged(_ i: NSMenuItem) { defaults.set(i.representedObject as? String, forKey: "answerLanguage") }
@@ -631,7 +782,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let c = store.active {
             return "Chat · \(c.count) capture\(c.count == 1 ? "" : "s") · expires in \(ChatStore.minutesLeft(c)) min"
         }
-        return "New chat · your next capture starts fresh"
+        return Settings.chatMinutes == 0 ? "Chat memory is off" : "New chat · your next capture starts fresh"
     }
 
     func handleClipboard() {
@@ -690,7 +841,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                    footer: existing.map { "Chat · \($0.count) capture\($0.count == 1 ? "" : "s") · continuing" } ?? "Starting a new chat…")
 
         var args = ["-p", "--model", model, "--effort", effort, "--output-format", "text",
-                    "--system-prompt", systemPrompt(language: answerLanguageName(answerLanguage))]
+                    "--system-prompt", systemPrompt(language: answerLanguageName(answerLanguage), length: Settings.answerLength)]
         args += existing == nil ? ["--session-id", sessionID] : ["--resume", sessionID]
         args += image ? ["--tools", "Read", "--allowedTools", "Read", "--add-dir", workDir] : ["--tools", ""]
 
@@ -707,6 +858,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.store.record(id: sessionID, title: String(title.prefix(60)),
                                       makeActive: self.store.activeID == activeAtStart)
                     self.popup.show(header: hdr, preview: preview, state: .result(text), footer: self.chatFooter())
+                    if Settings.autoCopy {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(text, forType: .string)
+                        self.lastChange = NSPasteboard.general.changeCount  // don't treat this as a capture
+                    }
+                    if Settings.sound { NSSound(named: "Pop")?.play() }
                 } else if existing != nil && text.localizedCaseInsensitiveContains("no conversation found") {
                     self.store.newChat()
                     self.ask(prompt: prompt, image: image, preview: preview)  // retry in a new chat
@@ -973,11 +1130,13 @@ final class PopupController: NSObject {
 
         switch state {
         case .loading:
+            closeWork?.cancel()
             copyBtn.isHidden = true
             resultText = ""
             startAnimating()
         case .result(let t):
             stopAnimating()
+            scheduleAutoClose(isDemo ? 0 : Settings.autoClose)
             copyBtn.isHidden = false
             resultText = t
             textView.textStorage?.setAttributedString(renderMarkdown(t))
@@ -1042,6 +1201,15 @@ final class PopupController: NSObject {
         let m = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { NSMouseInRect(m, $0.frame, false) } ?? NSScreen.main!
         let vf = screen.visibleFrame
+        switch Settings.popupPosition {
+        case "topRight":
+            panel.setFrame(NSRect(x: vf.maxX - width - 16, y: vf.maxY - height - 16, width: width, height: height), display: true)
+            return
+        case "center":
+            panel.setFrame(NSRect(x: vf.midX - width / 2, y: vf.midY - height / 2, width: width, height: height), display: true)
+            return
+        default: break
+        }
         var x = m.x + 18, y = m.y - height - 18
         x = min(max(x, vf.minX + 8), vf.maxX - width - 8)
         if y < vf.minY + 8 { y = min(m.y + 18, vf.maxY - height - 8) }
@@ -1068,6 +1236,20 @@ final class PopupController: NSObject {
         w.contentView = v
         w.orderFrontRegardless()
         backdrop = w
+    }
+
+    var closeWork: DispatchWorkItem?
+
+    /// Closes the pop-up after `seconds`, but waits while the mouse is over it.
+    func scheduleAutoClose(_ seconds: Int) {
+        closeWork?.cancel()
+        guard seconds > 0 else { return }
+        let w = DispatchWorkItem { [weak self] in
+            guard let self, self.panel.isVisible else { return }
+            if NSMouseInRect(NSEvent.mouseLocation, self.panel.frame, false) { self.scheduleAutoClose(3) } else { self.close() }
+        }
+        closeWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(seconds), execute: w)
     }
 
     @objc func close() {
