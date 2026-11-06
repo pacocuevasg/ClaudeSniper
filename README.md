@@ -13,7 +13,9 @@ A native macOS menu bar app that connects [TextSniper](https://textsniper.app) t
 ![Claude Code](https://img.shields.io/badge/Claude%20Code-your%20plan-D97757)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
 
-<img src="docs/popup.png" width="640" alt="ClaudeSniper pop-up showing an answer">
+<a href="docs/claudesniper-demo.mp4"><img src="docs/claudesniper-demo.gif" width="720" alt="ClaudeSniper demo: press ⌘⇧2, select text, and Claude answers in a pop-up"></a>
+
+<sub>▶ <a href="docs/claudesniper-demo.mp4">Watch the 31-second demo with sound (MP4)</a></sub>
 
 </div>
 
@@ -24,6 +26,10 @@ A native macOS menu bar app that connects [TextSniper](https://textsniper.app) t
 1. Press **⌘⇧2** and select part of your screen with TextSniper: a definition, an exam question, some code, a paragraph in another language…
 2. ClaudeSniper picks up the capture and sends it to Claude.
 3. A **pop-up appears next to your cursor** with the answer. No chat window to open.
+
+<div align="center">
+<img src="docs/popup.png" width="640" alt="ClaudeSniper pop-up showing an answer">
+</div>
 
 <table>
 <tr>
