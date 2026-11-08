@@ -1418,7 +1418,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Settings.superFast ? "Haiku · ⚡ super fast" : "\(label(models, model)) · \(label(efforts, effort).lowercased())"
     }
 
-    func ask(prompt: String, image: Bool, preview: String, followUp: String? = nil, allowWarm: Bool = true) {
+    func ask(prompt: String, image: Bool, preview: String, followUp: String? = nil, allowWarm: Bool = true, retried: Bool = false) {
         guard let claude = findClaude() else {
             popup.show(header: header(), preview: preview, state: .error("Claude Code wasn't found. Install it with:\ncurl -fsSL https://claude.ai/install.sh | bash"), footer: "")
             return
@@ -1459,7 +1459,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let finish: (Int32, String, Bool, String) -> Void = { status, raw, isError, errRaw in
             guard myID == self.requestID else { return }
-            logTiming("full answer (\(warm != nil ? "preloaded" : "normal"))")
+            logTiming("full answer (\(warm != nil ? "preloaded" : "normal"))" + (status == 0 && !isError ? "" : " ERROR status=\(status) isError=\(isError) text=\(raw.prefix(200)) err=\(errRaw.prefix(300))"))
             let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             let errText = errRaw.trimmingCharacters(in: .whitespacesAndNewlines)
             if status == 0 && !isError && !text.isEmpty {
@@ -1492,6 +1492,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else if all.contains("authenticate") || all.contains("/login") || all.contains("401") {
                 self.loggedIn = false
                 self.display(header: hdr, preview: preview, state: .error("You're not signed in to Claude Code.\nOpen the menu bar menu → “Sign in to Claude…”."), footer: "")
+            } else if !retried {
+                // A hiccup (e.g. the session was busy for a moment): try once more the normal way.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    self.ask(prompt: prompt, image: image, preview: preview, followUp: followUp, allowWarm: false, retried: true)
+                }
             } else {
                 let msg = !text.isEmpty ? text : !errText.isEmpty ? errText : "Unknown error (code \(status))."
                 self.display(header: hdr, preview: preview, state: .error(msg), footer: self.chatFooter())
