@@ -38,7 +38,8 @@ A native macOS menu bar app that connects [TextSniper](https://textsniper.app) t
 
 ### Features
 
-- **Live answers:** the text appears while Claude writes it.
+- **Live answers:** the text appears while Claude writes it, and the menu bar spark twinkles while Claude is answering.
+- **⚡ Super fast mode:** Haiku with no extended thinking, from a Claude Code process that's already running and waiting. First words in about 1 second instead of 3–4.
 - **Model:** Haiku · Sonnet · Opus · Fable. **Effort:** from *low* (seconds) to *max*.
 - **6 quick modes:** ✨ Auto · 💡 Explain · 💬 Translate · ≡ Summarize · ƒ Solve · ✓ Fix. Keys **1–6** re-run the same capture in another mode.
 - **Your own modes:** up to 3, with your own instruction (keys 7–9), from **My modes** in the menu.
@@ -48,6 +49,7 @@ A native macOS menu bar app that connects [TextSniper](https://textsniper.app) t
 - **Chat memory:** captures in a row share context (15 minutes by default, adjustable). Start a new chat or switch between recent ones.
 - **History:** every answer is saved and searchable. **Export a chat** to Markdown or Apple Notes.
 - **Show last answer:** ⌥⌘2 brings the pop-up back.
+- **Pin the pop-up:** the 📌 button keeps it open (no auto-close, esc doesn't close it) while you work next to it.
 - **Mini Clawd mode:** instead of the pop-up, a tiny Clawd walks while Claude thinks and hops with a **!** when the answer is ready. Click it to open the answer, drag it anywhere, right-click to hide it (Settings → Mini Clawd mode).
 - **Answer language:** match your Mac, or English, Español, Português, Français or Deutsch.
 - **Settings:** answer length, pop-up position, auto-close, auto-copy, a sound when the answer arrives, Mini Clawd mode, a custom capture shortcut, open at login.

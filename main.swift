@@ -197,6 +197,13 @@ enum Pixel {
         ]
         return seqs.map { pixelArt($0, px: px, pxH: px * 2, palette: clawdPalette()) }
     }
+    // Frames for the menu bar while Claude is answering: + → ✳ → × → ✳ → small, a twinkle.
+    static let sparkCross = ["....#....", "....#....", "....#....", "...###...", "#########", "...###...", "....#....", "....#....", "....#...."]
+    static let sparkX = ["#.......#", ".#.....#.", "..#...#..", "...###...", "...###...", "...###...", "..#...#..", ".#.....#.", "#.......#"]
+    static let sparkSmall = [".........", ".........", "....#....", "...###...", "..#####..", "...###...", "....#....", ".........", "........."]
+    static let busyIcons: [NSImage] = [sparkCross, spark, sparkX, spark, sparkSmall].map {
+        pixelArt($0, px: 2, palette: ["#": claudeOrange])
+    }
     static func menuBarIcon(on: Bool) -> NSImage {
         let img = pixelArt(spark, px: 2, palette: ["#": on ? claudeOrange : .black])
         img.isTemplate = !on
@@ -636,6 +643,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Shows a state in the pop-up, or in Mini Clawd when that mode is on for this request.
     func display(header: String, preview: String, state: PopupController.State, footer: String) {
+        switch state {
+        case .loading, .streaming: setBusy(true)
+        case .result, .error: setBusy(false)
+        }
         guard miniThisRequest else { popup.show(header: header, preview: preview, state: state, footer: footer); return }
         switch state {
         case .loading, .streaming:
@@ -712,6 +723,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let secs = value("--click-mini-after").flatMap(Double.init) {   // test: click Mini Clawd
             DispatchQueue.main.asyncAfter(deadline: .now() + secs) { self.miniClicked() }
         }
+        if a.contains("--demo-busy") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.setBusy(true) } }
+        if a.contains("--demo-pin") { DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.popup.togglePin() } }
         if a.contains("--demo-history") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.openHistory() } }
         if a.contains("--interpret-clipboard") {
             testMode = value("--mode")
@@ -758,7 +771,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    var iconTimer: Timer?
+    var iconFrame = 0
+
+    /// The menu bar spark twinkles while Claude is answering.
+    func setBusy(_ busy: Bool) {
+        if busy {
+            guard iconTimer == nil else { return }
+            iconFrame = 0
+            iconTimer = Timer.scheduledTimer(withTimeInterval: 0.14, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.iconFrame = (self.iconFrame + 1) % Pixel.busyIcons.count
+                self.statusItem.button?.image = Pixel.busyIcons[self.iconFrame]
+            }
+            statusItem.button?.toolTip = "ClaudeSniper: Claude is answering…"
+        } else {
+            iconTimer?.invalidate(); iconTimer = nil
+            updateIcon()
+        }
+    }
+
     func updateIcon() {
+        guard iconTimer == nil else { return }
         statusItem.button?.image = Pixel.menuBarIcon(on: enabled)
         statusItem.button?.toolTip = enabled ? "ClaudeSniper: on" : "ClaudeSniper: off"
     }
@@ -1602,6 +1636,9 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
     var copyBtn: NSButton!
     var newBtn: NSButton!
     var replaceBtn: NSButton!
+    var pinBtn: NSButton!
+    /// Pinned: the pop-up doesn't close by itself or with esc (only with ✕).
+    var pinned = false
     var speakBtn: NSButton!
     var askBtn: NSButton!
     let frames = Pixel.clawdFrames(px: 2)
@@ -1667,7 +1704,8 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         copyBtn = iconButton("doc.on.doc", "Copy answer", #selector(copyResult))
         newBtn = iconButton("square.and.pencil", "New chat", #selector(newChat))
         let closeBtn = iconButton("xmark", "Close (esc)", #selector(close))
-        let buttons = NSStackView(views: [replaceBtn, speakBtn, askBtn, copyBtn, newBtn, closeBtn])
+        pinBtn = iconButton("pin", "Pin: keep this pop-up open", #selector(togglePin))
+        let buttons = NSStackView(views: [pinBtn, replaceBtn, speakBtn, askBtn, copyBtn, newBtn, closeBtn])
         buttons.orientation = .horizontal
         buttons.spacing = 2
 
@@ -1786,7 +1824,10 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard let self, self.panel.isKeyWindow else { return e }
             let asking = !self.askField.isHidden
-            if e.keyCode == UInt16(kVK_Escape) { asking ? self.hideAsk() : self.close(); return nil }
+            if e.keyCode == UInt16(kVK_Escape) {
+                if asking { self.hideAsk() } else if self.pinned { NSSound.beep() } else { self.close() }
+                return nil
+            }
             if asking { return e }
             if e.keyCode == UInt16(kVK_Tab) && !self.resultText.isEmpty && !self.streamingNow { self.showAsk(); return nil }
             let modes = allModes()
@@ -2017,7 +2058,7 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
     /// Closes the pop-up after `seconds`, but waits while the mouse is over it or you're typing.
     func scheduleAutoClose(_ seconds: Int) {
         closeWork?.cancel()
-        guard seconds > 0 else { return }
+        guard seconds > 0, !pinned else { return }
         let w = DispatchWorkItem { [weak self] in
             guard let self, self.panel.isVisible else { return }
             if NSMouseInRect(NSEvent.mouseLocation, self.panel.frame, false) || !self.askField.isHidden || self.speech.isSpeaking {
@@ -2028,7 +2069,17 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(seconds), execute: w)
     }
 
+    @objc func togglePin() {
+        pinned.toggle()
+        pinBtn.image = NSImage(systemSymbolName: pinned ? "pin.fill" : "pin", accessibilityDescription: "Pin")
+        pinBtn.contentTintColor = pinned ? claudeOrange : NSColor.white.withAlphaComponent(0.6)
+        pinBtn.toolTip = pinned ? "Unpin" : "Pin: keep this pop-up open"
+        hintLabel.stringValue = pinned ? "📌 pinned · ✕ to close" : "1–6 modes · tab ask · esc close"
+        if pinned { closeWork?.cancel() } else if !resultText.isEmpty { scheduleAutoClose(Settings.autoClose) }
+    }
+
     @objc func close() {
+        if pinned { togglePin() }   // closing with ✕ also unpins
         stopSpeaking()
         hideAsk()
         NSAnimationContext.runAnimationGroup({ $0.duration = 0.12; panel.animator().alphaValue = 0 },
