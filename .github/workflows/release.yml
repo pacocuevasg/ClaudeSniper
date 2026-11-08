@@ -1,0 +1,30 @@
+# Builds the app and publishes it as a GitHub release when a version tag is pushed:
+#   git tag v1.1.0 && git push origin v1.1.0
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the universal app (Apple Silicon + Intel)
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          UNIVERSAL=1 NO_INSTALL=1 VERSION="$VERSION" ./build.sh
+          ditto -c -k --keepParent build/ClaudeSniper.app "ClaudeSniper-$VERSION.zip"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" "ClaudeSniper-$VERSION.zip" \
+            --title "ClaudeSniper $VERSION" --notes-file .github/release-notes.md

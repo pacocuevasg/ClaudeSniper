@@ -44,6 +44,7 @@ A native macOS menu bar app that connects [TextSniper](https://textsniper.app) t
 - **6 quick modes:** ✨ Auto · 💡 Explain · 💬 Translate · ≡ Summarize · ƒ Solve · ✓ Fix. Keys **1–6** re-run the same capture in another mode.
 - **Your own modes:** up to 3, with your own instruction (keys 7–9), from **My modes** in the menu.
 - **Follow-up questions:** press **Tab** in the pop-up to ask "and why?" in the same chat.
+- **Whole conversation:** the stack button in the pop-up shows the chat as a thread (earlier captures dimmed, the latest at the bottom). Clicking Mini Clawd opens it this way.
 - **Replace:** in Fix and Translate, paste the result back where you captured it.
 - **Read aloud** in the answer's language.
 - **Chat memory:** captures in a row share context (15 minutes by default, adjustable). Start a new chat or switch between recent ones.
@@ -76,6 +77,16 @@ A native macOS menu bar app that connects [TextSniper](https://textsniper.app) t
 
 ## Installation
 
+### Download (no Xcode needed)
+
+1. Download the latest **ClaudeSniper-x.y.z.zip** from [Releases](https://github.com/pacocuevasg/ClaudeSniper/releases/latest) and unzip it.
+2. Move **ClaudeSniper.app** to **Applications** and open it.
+3. The first time, macOS says it can't check the app (it isn't notarized by Apple): open **System Settings → Privacy & Security** and click **Open Anyway**.
+
+Works on Apple Silicon and Intel.
+
+### Or build it yourself
+
 ```bash
 git clone https://github.com/pacocuevasg/ClaudeSniper.git
 cd ClaudeSniper
@@ -83,7 +94,9 @@ cd ClaudeSniper
 open /Applications/ClaudeSniper.app
 ```
 
-The first time, from the ✨ menu in the menu bar:
+### First launch
+
+A **welcome guide** checks that Claude Code is installed, helps you sign in, checks for TextSniper and lets you try a sample answer. You can reopen it from **Settings → Welcome guide**.
 
 1. **Sign in to Claude…** opens Terminal with `claude auth login`.
 2. Flip the switch on, pick a model, effort and mode, and try ⌘⇧2 in TextSniper.

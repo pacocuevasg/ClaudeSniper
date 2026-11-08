@@ -629,7 +629,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var historyWindow: HistoryWindowController?
     /// Session of the last answer (follow-ups continue it, even with chat memory off).
     var lastSessionID: String?
-    struct Shown { let header: String; let preview: String; let text: String; let mode: String; let footer: String; let replace: Bool }
+    struct Shown { let header: String; let preview: String; let text: String; let mode: String; let footer: String; let replace: Bool; let chatID: String }
     var lastShown: Shown?
     var testMode: String?
     var testTimingLog: Bool { CommandLine.arguments.contains("--interpret-clipboard") }
@@ -654,7 +654,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             mini.show(.thinking)
         case .result:
             mini.show(.ready)
-            miniPending = { [weak self] in self?.popup.show(header: header, preview: preview, state: state, footer: footer) }
+            // Clicking Clawd opens the whole conversation.
+            miniPending = { [weak self] in
+                self?.popup.showThread = true
+                self?.popup.show(header: header, preview: preview, state: state, footer: footer)
+            }
         case .error:
             mini.show(.error)
             miniPending = { [weak self] in self?.popup.show(header: header, preview: preview, state: state, footer: footer) }
@@ -708,6 +712,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         registerShowLastHotkey()
         signal(SIGPIPE, SIG_IGN)  // a preloaded process may close its input
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.prewarm() }
+        // First launch: a short guide (Claude Code, sign-in, TextSniper, a test).
+        if !defaults.bool(forKey: "onboarded") && !CommandLine.arguments.contains(where: { $0.hasPrefix("--") }) || CommandLine.arguments.contains("--demo-welcome") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.openWelcome() }
+        }
         if CommandLine.arguments.contains("--demo") { demo() }
         // Testing without TextSniper: interpret what's on the clipboard, optionally in a mode,
         // then ask a follow-up. e.g. --interpret-clipboard --mode fix --follow-up "Why?"
@@ -723,6 +731,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let secs = value("--click-mini-after").flatMap(Double.init) {   // test: click Mini Clawd
             DispatchQueue.main.asyncAfter(deadline: .now() + secs) { self.miniClicked() }
         }
+        if a.contains("--thread") { popup.showThread = true }   // test: open answers as a conversation
         if a.contains("--demo-busy") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.setBusy(true) } }
         if a.contains("--demo-pin") { DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.popup.togglePin() } }
         if a.contains("--demo-history") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.openHistory() } }
@@ -1084,7 +1093,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         miniPending = nil
         popup.mode = s.mode
         popup.allowReplace = s.replace
+        popup.thread = history.chat(s.chatID)
         popup.show(header: s.header, preview: s.preview, state: .result(s.text), footer: s.footer)
+    }
+
+    var welcome: WelcomeWindowController?
+    @objc func openWelcome() {
+        if welcome == nil { welcome = WelcomeWindowController() }
+        welcome?.show()
+    }
+
+    /// The welcome guide's test: a real answer about a sample sentence.
+    func trySample() {
+        let t = "A menu bar app lives in the top bar of your Mac and stays out of your way until you need it."
+        lastCapture = Capture(text: t, imagePath: nil, preview: t)
+        run(lastCapture!, modeID: "explain", again: false)
     }
 
     @objc func openHistory() {
@@ -1186,6 +1209,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.addItem(li)
         m.addItem(.separator())
         m.addItem(item("Change capture shortcut (\(hotkeyLabel))…", "keyboard", #selector(changeShortcut)))
+        m.addItem(item("Welcome guide…", "hand.wave", #selector(openWelcome)))
         if hotkeyLabel != "⌘⇧2" { m.addItem(item("Reset shortcut to ⌘⇧2", "arrow.uturn.backward", #selector(resetShortcut))) }
         let clear = item("Clear all chats", "trash", #selector(clearChats))
         clear.isEnabled = !store.recent.isEmpty
@@ -1293,8 +1317,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(URL(fileURLWithPath: path))
     }
 
-    func refreshAuth() {
-        guard let claude = findClaude() else { return }
+    func refreshAuth(_ done: ((Bool) -> Void)? = nil) {
+        guard let claude = findClaude() else { done?(false); return }
         DispatchQueue.global().async {
             let out = runSync(claude, ["auth", "status"], stdin: nil, timeout: 20).output
             var ok = false, acct = ""
@@ -1303,7 +1327,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 ok = obj["loggedIn"] as? Bool ?? false
                 acct = (obj["email"] ?? obj["subscriptionType"]) as? String ?? ""
             }
-            DispatchQueue.main.async { self.loggedIn = ok; self.account = isDemo ? "" : acct }
+            DispatchQueue.main.async { self.loggedIn = ok; self.account = isDemo ? "" : acct; done?(ok) }
         }
     }
 
@@ -1470,8 +1494,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.history.add(HistoryEntry(chatID: sessionID, mode: modeLabel, model: hdr,
                                               capture: captureText, followUp: followUp, answer: text))
                 let footer = self.chatFooter()
+                self.popup.thread = self.history.chat(sessionID)
                 self.display(header: hdr, preview: preview, state: .result(text), footer: footer)
-                self.lastShown = Shown(header: hdr, preview: preview, text: text, mode: self.popup.mode, footer: footer, replace: followUp == nil)
+                self.lastShown = Shown(header: hdr, preview: preview, text: text, mode: self.popup.mode, footer: footer, replace: followUp == nil, chatID: sessionID)
                 if Settings.autoCopy {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(text, forType: .string)
@@ -1660,6 +1685,12 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
     var mode = "auto" { didSet { refreshModeBar() } }
     /// False for follow-up answers: Replace would paste an explanation, not the fixed text.
     var allowReplace = true
+    /// The whole chat, oldest first (the last entry is the answer on screen).
+    var thread: [HistoryEntry] = []
+    /// Show the whole conversation instead of only the last answer.
+    var showThread = false
+    var threadBtn: NSButton!
+    var lastArgs: (header: String, preview: String, footer: String)?
     let speech = AVSpeechSynthesizer()
 
     override init() {
@@ -1710,7 +1741,8 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         newBtn = iconButton("square.and.pencil", "New chat", #selector(newChat))
         let closeBtn = iconButton("xmark", "Close (esc)", #selector(close))
         pinBtn = iconButton("pin", "Pin: keep this pop-up open", #selector(togglePin))
-        let buttons = NSStackView(views: [pinBtn, replaceBtn, speakBtn, askBtn, copyBtn, newBtn, closeBtn])
+        threadBtn = iconButton("rectangle.stack", "Show the whole conversation", #selector(toggleThread))
+        let buttons = NSStackView(views: [threadBtn, pinBtn, replaceBtn, speakBtn, askBtn, copyBtn, newBtn, closeBtn])
         buttons.orientation = .horizontal
         buttons.spacing = 2
 
@@ -1919,12 +1951,14 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
 
     func setAnswerButtons(visible: Bool) {
         copyBtn.isHidden = !visible
+        threadBtn.isHidden = !(visible && thread.count > 1)
         speakBtn.isHidden = !visible
         askBtn.isHidden = !visible
         replaceBtn.isHidden = !(visible && allowReplace && replaceableModes.contains(mode))
     }
 
     func show(header: String, preview: String, state: State, footer: String) {
+        lastArgs = (header, preview, footer)
         chip.stringValue = "  \(header)  "
         let pv = preview.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
         quoteLabel.stringValue = pv.isEmpty ? "—" : pv
@@ -1955,7 +1989,7 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
             scheduleAutoClose(isDemo ? 0 : Settings.autoClose)
             resultText = t
             setAnswerButtons(visible: true)
-            textView.textStorage?.setAttributedString(renderMarkdown(t))
+            textView.textStorage?.setAttributedString(showThread && thread.count > 1 ? renderThread() : renderMarkdown(t))
         case .error(let t):
             streamingNow = false
             stopAnimating()
@@ -1989,7 +2023,7 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
             panel.orderFrontRegardless()
         }
         panel.makeKey()
-        if streaming { textView.scrollToEndOfDocument(nil) } else { scroll.contentView.scroll(to: .zero) }
+        if streaming || (showThread && thread.count > 1) { textView.scrollToEndOfDocument(nil) } else { scroll.contentView.scroll(to: .zero) }
     }
 
     func startAnimating() {
@@ -2072,6 +2106,44 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         }
         closeWork = w
         DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(seconds), execute: w)
+    }
+
+    @objc func toggleThread() {
+        showThread.toggle()
+        threadBtn.image = NSImage(systemSymbolName: showThread ? "rectangle.stack.fill" : "rectangle.stack", accessibilityDescription: nil)
+        threadBtn.contentTintColor = showThread ? claudeOrange : NSColor.white.withAlphaComponent(0.6)
+        threadBtn.toolTip = showThread ? "Show only the last answer" : "Show the whole conversation"
+        if let a = lastArgs, !resultText.isEmpty { show(header: a.header, preview: a.preview, state: .result(resultText), footer: a.footer) }
+    }
+
+    /// The chat as a thread: earlier captures and answers dimmed, the latest one at the bottom.
+    func renderThread() -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        let para = NSMutableParagraphStyle(); para.paragraphSpacing = 4
+        var n = 0
+        for (i, e) in thread.enumerated() {
+            let latest = i == thread.count - 1
+            var label: String
+            if let q = e.followUp { label = "↳ " + q } else {
+                n += 1
+                label = "Capture \(n) · \(e.mode) — " + e.capture.replacingOccurrences(of: "\n", with: " ")
+            }
+            if label.count > 95 { label = String(label.prefix(94)) + "…" }
+            out.append(NSAttributedString(string: label + "\n", attributes: [
+                .font: NSFont.systemFont(ofSize: 11.5, weight: .semibold),
+                .foregroundColor: claudeOrange.withAlphaComponent(latest ? 1 : 0.65), .paragraphStyle: para]))
+            let body = NSMutableAttributedString(attributedString: renderMarkdown(e.answer))
+            if !latest {
+                body.enumerateAttribute(.foregroundColor, in: NSRange(location: 0, length: body.length)) { v, r, _ in
+                    if let c = v as? NSColor { body.addAttribute(.foregroundColor, value: c.withAlphaComponent(c.alphaComponent * 0.55), range: r) }
+                }
+            }
+            out.append(body)
+            if !latest {
+                out.append(NSAttributedString(string: "\n\n", attributes: [.font: NSFont.systemFont(ofSize: 6)]))
+            }
+        }
+        return out
     }
 
     @objc func togglePin() {
@@ -2362,6 +2434,167 @@ final class MiniClawd: NSObject {
         bubble.frame.origin.y = 46 + lift
         let s = 1 - min(lift, 12) / 40
         shadow.frame = NSRect(x: 14 + (1 - s) * 20, y: 4, width: 40 * s, height: 8)
+    }
+}
+
+// MARK: - Welcome window (first launch)
+
+final class WelcomeWindowController: NSObject, NSWindowDelegate {
+    struct Row { let icon: NSImageView; let detail: NSTextField; let button: NSButton }
+    let window: NSWindow
+    var rows: [Row] = []
+    let startBtn = NSButton(title: "Turn on ClaudeSniper", target: nil, action: nil)
+
+    override init() {
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 500),
+                          styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
+        super.init()
+        window.title = "Welcome to ClaudeSniper"
+        window.titlebarAppearsTransparent = true
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        let content = NSView()
+        window.contentView = content
+
+        let clawd = NSImageView(image: Pixel.clawd(px: 4))
+        clawd.imageScaling = .scaleNone
+        let title = NSTextField(labelWithString: "Welcome to ClaudeSniper")
+        title.font = .systemFont(ofSize: 22, weight: .bold)
+        let sub = NSTextField(wrappingLabelWithString: "Capture anything on your screen with TextSniper (⌘⇧2) and Claude explains it in a pop-up, using your Claude plan. A few quick checks:")
+        sub.font = .systemFont(ofSize: 13)
+        sub.textColor = .secondaryLabelColor
+        sub.alignment = .center
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 14
+        let specs: [(String, String, String, Selector)] = [
+            ("Claude Code", "The free command-line app ClaudeSniper uses to talk to Claude.", "Install…", #selector(installClaude)),
+            ("Signed in to your Claude plan", "Pro or Max. Usage comes from your plan; no API key.", "Sign in…", #selector(signIn)),
+            ("TextSniper", "The OCR app that copies text from your screen with ⌘⇧2.", "Get TextSniper", #selector(getTextSniper)),
+            ("Try it", "See a real answer in the pop-up with a sample sentence.", "Try a sample", #selector(trySample)),
+        ]
+        for (name, detail, button, action) in specs {
+            let icon = NSImageView()
+            icon.symbolConfiguration = .init(pointSize: 20, weight: .medium)
+            let n = NSTextField(labelWithString: name)
+            n.font = .systemFont(ofSize: 13.5, weight: .semibold)
+            let d = NSTextField(wrappingLabelWithString: detail)
+            d.font = .systemFont(ofSize: 11.5)
+            d.textColor = .secondaryLabelColor
+            d.preferredMaxLayoutWidth = 300
+            let texts = NSStackView(views: [n, d])
+            texts.orientation = .vertical
+            texts.alignment = .leading
+            texts.spacing = 2
+            let b = NSButton(title: button, target: self, action: action)
+            b.bezelStyle = .rounded
+            let spacer = NSView()
+            spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            let row = NSStackView(views: [icon, texts, spacer, b])
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.spacing = 12
+            row.translatesAutoresizingMaskIntoConstraints = false
+            row.widthAnchor.constraint(equalToConstant: 460).isActive = true
+            icon.widthAnchor.constraint(equalToConstant: 26).isActive = true
+            stack.addArrangedSubview(row)
+            rows.append(Row(icon: icon, detail: d, button: b))
+        }
+
+        let again = NSButton(title: "Check again", target: self, action: #selector(refresh))
+        again.bezelStyle = .rounded
+        startBtn.target = self
+        startBtn.action = #selector(finish)
+        startBtn.bezelStyle = .rounded
+        startBtn.keyEquivalent = "\r"
+        let bottom = NSStackView(views: [again, startBtn])
+        bottom.orientation = .horizontal
+        bottom.spacing = 10
+
+        for v in [clawd, title, sub, stack, bottom] as [NSView] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(v)
+        }
+        NSLayoutConstraint.activate([
+            clawd.topAnchor.constraint(equalTo: content.topAnchor, constant: 40),
+            clawd.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            clawd.widthAnchor.constraint(equalToConstant: 68),
+            clawd.heightAnchor.constraint(equalToConstant: 48),
+            title.topAnchor.constraint(equalTo: clawd.bottomAnchor, constant: 14),
+            title.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            sub.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
+            sub.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            sub.widthAnchor.constraint(equalToConstant: 440),
+            stack.topAnchor.constraint(equalTo: sub.bottomAnchor, constant: 24),
+            stack.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            bottom.topAnchor.constraint(greaterThanOrEqualTo: stack.bottomAnchor, constant: 24),
+            bottom.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -40),
+            bottom.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -24),
+        ])
+    }
+
+    func show() {
+        refresh()
+        NSApp.activate(ignoringOtherApps: true)
+        if !window.isVisible { window.center() }
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    /// Re-check when you come back from Terminal (installing or signing in).
+    func windowDidBecomeKey(_ n: Notification) { refresh() }
+
+    func set(_ i: Int, _ state: Bool?) {
+        let (sym, color): (String, NSColor) = state == nil ? ("hourglass", .secondaryLabelColor)
+            : state! ? ("checkmark.circle.fill", .systemGreen) : ("exclamationmark.circle.fill", .systemOrange)
+        rows[i].icon.image = NSImage(systemSymbolName: sym, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(paletteColors: state == nil ? [color] : [.white, color]))
+        rows[i].button.isHidden = state == true && i < 3
+    }
+
+    static func textSniperInstalled() -> Bool {
+        ["com.valerijs.boguckis.store.TextSniper", "com.valerijs.boguckis.TextSniper"]
+            .contains { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) != nil }
+            || FileManager.default.fileExists(atPath: "/Applications/TextSniper.app")
+    }
+
+    @objc func refresh() {
+        let hasClaude = findClaude() != nil
+        set(0, hasClaude)
+        set(2, Self.textSniperInstalled())
+        set(3, false)
+        rows[3].icon.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(paletteColors: [claudeOrange]))
+        rows[1].button.isEnabled = hasClaude
+        rows[3].button.isEnabled = false
+        guard hasClaude else { set(1, false); return }
+        set(1, nil)
+        appDelegate?.refreshAuth { [weak self] ok in
+            self?.set(1, ok)
+            self?.rows[3].button.isEnabled = ok
+        }
+    }
+
+    @objc func installClaude() {
+        let path = workDir + "/install-claude.command"
+        let script = """
+        #!/bin/zsh
+        echo "Installing Claude Code (https://claude.ai/install.sh)…"
+        curl -fsSL https://claude.ai/install.sh | bash
+        echo; echo "Done. Go back to ClaudeSniper and click Check again."
+        """
+        try? script.write(toFile: path, atomically: true, encoding: .utf8)
+        chmod(path, 0o755)
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+    }
+    @objc func signIn() { appDelegate?.login() }
+    @objc func getTextSniper() { NSWorkspace.shared.open(URL(string: "https://textsniper.app")!) }
+    @objc func trySample() { appDelegate?.trySample() }
+    @objc func finish() {
+        defaults.set(true, forKey: "onboarded")
+        if appDelegate?.enabled == false { appDelegate?.enabled = true }
+        window.close()
     }
 }
 
