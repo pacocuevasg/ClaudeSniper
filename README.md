@@ -39,19 +39,20 @@ A native macOS menu bar app that connects [TextSniper](https://textsniper.app) t
 ### Features
 
 - **Live answers:** the text appears while Claude writes it, and the menu bar spark twinkles while Claude is answering.
-- **⚡ Super fast mode:** Haiku with no extended thinking, from a Claude Code process that's already running and waiting. First words in about 1 second instead of 3–4.
-- **Model:** Haiku · Sonnet · Opus · Fable. **Effort:** from *low* (seconds) to *max*.
+- **Rich answers:** headings, lists, tables, quotes and code blocks are rendered, not shown as raw Markdown.
+- **Model:** ⚡ Fast · Haiku · Sonnet · Opus · Fable. **Effort:** from *low* (seconds) to *max*.
+- **⚡ Fast** (Super fast mode): Haiku with no extended thinking, from a Claude Code process that's already running and waiting. First words in about 1 second instead of 3–4.
 - **6 quick modes:** ✨ Auto · 💡 Explain · 💬 Translate · ≡ Summarize · ƒ Solve · ✓ Fix. Keys **1–6** re-run the same capture in another mode.
 - **Your own modes:** up to 3, with your own instruction (keys 7–9), from **My modes** in the menu.
 - **Follow-up questions:** press **Tab** in the pop-up to ask "and why?" in the same chat.
-- **Whole conversation:** the stack button in the pop-up shows the chat as a thread (earlier captures dimmed, the latest at the bottom). Clicking Mini Clawd opens it this way.
+- **Whole conversation:** click the chat status at the bottom of the pop-up (or ⌘T) to see the chat as a thread: earlier captures dimmed, the latest at the bottom. Clicking Mini Clawd opens it this way.
 - **Replace:** in Fix and Translate, paste the result back where you captured it.
 - **Read aloud** in the answer's language.
 - **Chat memory:** captures in a row share context (15 minutes by default, adjustable). Start a new chat or switch between recent ones.
-- **History:** every answer is saved and searchable. **Export a chat** to Markdown or Apple Notes.
+- **History:** every answer is saved, searchable and grouped by day. Open any answer in the pop-up again to keep asking, or **export a chat** to Markdown or Apple Notes.
 - **Show last answer:** ⌥⌘2 brings the pop-up back.
-- **Pin the pop-up:** the 📌 button keeps it open (no auto-close, esc doesn't close it) while you work next to it.
-- **Mini Clawd mode:** instead of the pop-up, a tiny Clawd walks while Claude thinks and hops with a **!** when the answer is ready. Click it to open the answer, drag it anywhere, right-click to hide it (Settings → Mini Clawd mode).
+- **Pin the pop-up:** the pin button (⌘P) keeps it open (no auto-close, esc doesn't close it) while you work next to it.
+- **Mini Clawd mode:** instead of the pop-up, a tiny Clawd walks while Claude thinks and hops with a **!** when the answer is ready. Click it to open the answer, drag it anywhere, right-click to hide it (Settings → Mini Clawd).
 - **Answer language:** match your Mac, or English, Español, Português, Français or Deutsch.
 - **Settings:** answer length, pop-up position, auto-close, auto-copy, a sound when the answer arrives, Mini Clawd mode, a custom capture shortcut, open at login.
 - **Images:** if the clipboard holds an image, Claude analyzes it.
@@ -60,6 +61,28 @@ A native macOS menu bar app that connects [TextSniper](https://textsniper.app) t
 </td>
 </tr>
 </table>
+
+### In the pop-up
+
+| Key | What it does |
+|---|---|
+| **1–6** (7–9 for your modes) | Re-run the same capture in another mode |
+| **Tab** | Ask a follow-up in the same chat |
+| **⌘C** | Copy the answer (or just the selected text) |
+| **⌘↩** | Replace: paste the result where you captured it (Fix and Translate) |
+| **⌘T** | Show the whole conversation |
+| **⌘P** | Pin the pop-up open |
+| **⌘R** | Read aloud |
+| **⌘N** | New chat |
+| **Esc** | Close |
+
+The **⋯** button has the same actions, plus Export chat and History.
+
+<div align="center">
+<img src="docs/markdown.png" width="640" alt="An answer with a numbered list, a code block, a table and a quote">
+<br><br>
+<img src="docs/history.png" width="760" alt="The History window: answers grouped by day on the left, the selected answer on the right">
+</div>
 
 <div align="center">
 <img src="docs/loading.png" width="560" alt="Pop-up while Claude is thinking">
@@ -138,6 +161,7 @@ TextSniper copies the text ──► clipboard changes while the overlay is up
 Most things are in the menu under **Settings**. For deeper changes, everything is at the top of [`main.swift`](main.swift):
 
 - `systemPrompt`: how Claude answers (style, rules).
+- `Theme`: the colors and corner radius used by the pop-up, the welcome window and the app icon.
 - `builtInModes`: the six built-in quick action modes (name, SF Symbol icon and instruction). For your own modes you don't need code: use **My modes** in the menu.
 - `languages`: the answer languages offered in the menu.
 - `Settings` and the `…Options` lists: the choices shown in the Settings menu.

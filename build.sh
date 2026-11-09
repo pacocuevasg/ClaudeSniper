@@ -31,6 +31,7 @@ cat > "$BUILD/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>ClaudeSniper</string>
   <key>CFBundleExecutable</key><string>ClaudeSniper</string>
   <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
@@ -39,6 +40,10 @@ cat > "$BUILD/Contents/Info.plist" <<PLIST
   <key>NSAppleEventsUsageDescription</key><string>ClaudeSniper exports a chat to Apple Notes when you ask it to.</string>
 </dict></plist>
 PLIST
+
+# The icon is committed (AppIcon.icns); tools/make_icon.py regenerates it.
+mkdir -p "$BUILD/Contents/Resources"
+cp AppIcon.icns "$BUILD/Contents/Resources/AppIcon.icns"
 
 codesign --force --deep -s - "$BUILD"
 if [[ -n "$NO_INSTALL" ]]; then

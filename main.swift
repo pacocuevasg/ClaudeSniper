@@ -3,6 +3,10 @@
 // TextSniper, it sends the capture to Claude (through Claude Code, using your plan) and
 // shows the answer in a pop-up. Captures are grouped into a chat that expires after a
 // while without use (15 min by default, see Settings); you can start a new chat or switch.
+//
+// File map: settings and modes · design tokens and Markdown · chats and history ·
+// Claude Code processes · AppDelegate (menu, capture detection, asking Claude) ·
+// pop-up · Mini Clawd · welcome window · history window.
 
 import Cocoa
 import ServiceManagement
@@ -211,6 +215,255 @@ enum Pixel {
     }
 }
 
+// MARK: - Design tokens
+
+/// One place for the look: colors, radii and the warm gradient.
+enum Theme {
+    static let accent = claudeOrange
+    /// A lighter orange that stays readable as text on the dark glass.
+    static let accentSoft = claudeOrange.blended(withFraction: 0.35, of: .white)!
+    static let radius: CGFloat = 18
+    // On the pop-up's dark glass:
+    static let ink = NSColor.white.withAlphaComponent(0.92)
+    static let ink2 = NSColor.white.withAlphaComponent(0.60)
+    static let ink3 = NSColor.white.withAlphaComponent(0.38)
+    static let fill = NSColor.white.withAlphaComponent(0.07)
+    static let fillHover = NSColor.white.withAlphaComponent(0.14)
+    static let stroke = NSColor.white.withAlphaComponent(0.10)
+
+    /// The warm gradient behind the pop-up in demos, the welcome header and the app icon.
+    static func gradient(_ size: NSSize) -> CAGradientLayer {
+        let g = CAGradientLayer()
+        g.colors = [NSColor(srgbRed: 0.42, green: 0.20, blue: 0.13, alpha: 1).cgColor,
+                    NSColor(srgbRed: 0.10, green: 0.08, blue: 0.09, alpha: 1).cgColor,
+                    NSColor(srgbRed: 0.16, green: 0.12, blue: 0.20, alpha: 1).cgColor]
+        g.startPoint = CGPoint(x: 0, y: 1)
+        g.endPoint = CGPoint(x: 1, y: 0)
+        g.frame = CGRect(origin: .zero, size: size)
+        return g
+    }
+}
+
+/// A borderless button with a rounded background that lights up under the mouse.
+final class HoverButton: NSButton {
+    var normalBg = NSColor.clear { didSet { apply() } }
+    var hoverBg = Theme.fillHover { didSet { apply() } }
+    private var hovering = false
+    private var area: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let a = area { removeTrackingArea(a) }
+        let a = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        addTrackingArea(a)
+        area = a
+    }
+    override func mouseEntered(with e: NSEvent) { hovering = true; apply() }
+    override func mouseExited(with e: NSEvent) { hovering = false; apply() }
+    override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true }
+    override func viewDidHide() { super.viewDidHide(); hovering = false; apply() }
+    func apply() {
+        wantsLayer = true
+        layer?.backgroundColor = (hovering ? hoverBg : normalBg).cgColor
+    }
+}
+
+// MARK: - Markdown
+
+/// Colors and sizes for rendered answers: the dark pop-up, or a normal window (light or dark).
+struct MDTheme {
+    var size: CGFloat
+    var width: CGFloat          // text width, used to space table columns
+    var text: NSColor
+    var strong: NSColor
+    var secondary: NSColor
+    var codeText: NSColor
+    var codeBg: NSColor
+
+    static let popup = MDTheme(size: 14, width: 560, text: Theme.ink, strong: .white, secondary: Theme.ink2,
+                               codeText: Theme.accentSoft, codeBg: NSColor.white.withAlphaComponent(0.08))
+    static let window = MDTheme(size: 13.5, width: 520, text: .labelColor, strong: .labelColor, secondary: .secondaryLabelColor,
+                                codeText: NSColor(name: nil) { $0.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? Theme.accentSoft : claudeOrangeDark },
+                                codeBg: NSColor.labelColor.withAlphaComponent(0.07))
+}
+
+/// Renders the Markdown Claude writes: headings, bold/italic/code, bullet and numbered
+/// lists, quotes, fenced code blocks, simple tables and rules.
+enum Markdown {
+    static func inline(_ md: String, font: NSFont, color: NSColor, _ th: MDTheme) -> NSMutableAttributedString {
+        let parsed = (try? AttributedString(markdown: md, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(md)
+        let out = NSMutableAttributedString()
+        for run in parsed.runs {
+            var f = font, c = color
+            var attrs: [NSAttributedString.Key: Any] = [:]
+            if let i = run.inlinePresentationIntent {
+                if i.contains(.code) {
+                    f = .monospacedSystemFont(ofSize: font.pointSize - 1.5, weight: .regular)
+                    c = th.codeText
+                    attrs[.backgroundColor] = th.codeBg
+                } else {
+                    var t = font.fontDescriptor.symbolicTraits
+                    if i.contains(.stronglyEmphasized) { t.insert(.bold); c = th.strong }
+                    if i.contains(.emphasized) { t.insert(.italic) }
+                    f = NSFont(descriptor: font.fontDescriptor.withSymbolicTraits(t), size: font.pointSize) ?? font
+                    if i.contains(.strikethrough) { attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
+                }
+            }
+            if let url = run.link { attrs[.link] = url }
+            attrs[.font] = f
+            attrs[.foregroundColor] = c
+            out.append(NSAttributedString(string: String(parsed[run.range].characters), attributes: attrs))
+        }
+        return out
+    }
+
+    static func render(_ raw: String, _ th: MDTheme = .popup) -> NSAttributedString {
+        let base = NSFont.systemFont(ofSize: th.size)
+        var blocks: [NSAttributedString] = []
+        var gap = false   // a blank line came before the next block
+
+        func style(indent: CGFloat = 0, first: CGFloat? = nil, after: CGFloat = 3, tab: CGFloat? = nil) -> NSMutableParagraphStyle {
+            let p = NSMutableParagraphStyle()
+            p.lineSpacing = 2.5
+            p.paragraphSpacing = after
+            p.paragraphSpacingBefore = blocks.isEmpty ? 0 : (gap ? 8 : 0)
+            p.headIndent = indent
+            p.firstLineHeadIndent = first ?? indent
+            if let t = tab { p.tabStops = [NSTextTab(textAlignment: .left, location: t)]; p.defaultTabInterval = t }
+            return p
+        }
+        func add(_ s: NSMutableAttributedString, _ p: NSParagraphStyle) {
+            guard s.length > 0 else { return }
+            s.addAttribute(.paragraphStyle, value: p, range: NSRange(location: 0, length: s.length))
+            blocks.append(s)
+            gap = false
+        }
+        func depthAndX(_ marker: Substring) -> CGFloat {
+            CGFloat(min(marker.prefix { $0 == " " || $0 == "\t" }.count / 2, 3)) * 16
+        }
+
+        let lines = raw.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
+        var i = 0
+        while i < lines.count {
+            let line = lines[i]
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            // Fenced code block
+            if trimmed.hasPrefix("```") {
+                var code: [String] = []
+                i += 1
+                while i < lines.count, !lines[i].trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                    code.append(lines[i].replacingOccurrences(of: "\t", with: "    "))
+                    i += 1
+                }
+                i += 1
+                while code.last?.trimmingCharacters(in: .whitespaces).isEmpty == true { code.removeLast() }
+                // Pad every line to the same length so the background is one clean rectangle.
+                let w = min(max(code.map { $0.count }.max() ?? 0, 28), 76)
+                let mono = NSFont.monospacedSystemFont(ofSize: th.size - 2, weight: .regular)
+                gap = true
+                for (n, l) in code.enumerated() {
+                    let s = NSMutableAttributedString(string: " " + l.padding(toLength: max(w, l.count), withPad: " ", startingAt: 0) + " ",
+                                                      attributes: [.font: mono, .foregroundColor: th.text, .backgroundColor: th.codeBg])
+                    let p = style(after: n == code.count - 1 ? 6 : 0)
+                    p.lineSpacing = 0
+                    p.lineBreakMode = .byCharWrapping
+                    add(s, p)
+                }
+                gap = true
+                continue
+            }
+            if trimmed.isEmpty { gap = true; i += 1; continue }
+
+            // Rule
+            if trimmed.range(of: #"^([-*_])\1{2,}$"#, options: .regularExpression) != nil {
+                gap = true
+                add(NSMutableAttributedString(string: String(repeating: "─", count: 26), attributes: [
+                    .font: NSFont.systemFont(ofSize: 9), .foregroundColor: th.secondary.withAlphaComponent(0.4)]), style())
+                gap = true
+                i += 1; continue
+            }
+            // Heading
+            if let r = trimmed.range(of: #"^#{1,6}\s+"#, options: .regularExpression) {
+                let level = trimmed[r].filter { $0 == "#" }.count
+                let f = NSFont.systemFont(ofSize: th.size + (level == 1 ? 3.5 : level == 2 ? 2 : 0.5), weight: level <= 2 ? .bold : .semibold)
+                let p = style(after: 4)
+                if !blocks.isEmpty { p.paragraphSpacingBefore = 10 }
+                add(inline(String(trimmed[r.upperBound...]), font: f, color: th.strong, th), p)
+                i += 1; continue
+            }
+            // Quote
+            if trimmed.hasPrefix(">") {
+                let s = NSMutableAttributedString(string: "▎ ", attributes: [.font: base, .foregroundColor: Theme.accent.withAlphaComponent(0.75)])
+                s.append(inline(trimmed.dropFirst().trimmingCharacters(in: .whitespaces), font: base, color: th.secondary, th))
+                add(s, style(indent: 14, first: 0))
+                i += 1; continue
+            }
+            // Table: consecutive |a|b| rows
+            if trimmed.hasPrefix("|"), trimmed.hasSuffix("|"), trimmed.count > 2 {
+                var table: [[String]] = []
+                while i < lines.count {
+                    let t = lines[i].trimmingCharacters(in: .whitespaces)
+                    guard t.hasPrefix("|"), t.hasSuffix("|"), t.count > 2 else { break }
+                    if t.range(of: #"^\|[\s:|-]+\|$"#, options: .regularExpression) == nil {
+                        table.append(t.dropFirst().dropLast().components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) })
+                    }
+                    i += 1
+                }
+                let cols = max(table.map { $0.count }.max() ?? 1, 2)
+                let colW = th.width / CGFloat(cols)
+                gap = true
+                for (n, row) in table.enumerated() {
+                    let f = NSFont.systemFont(ofSize: th.size - 1, weight: n == 0 ? .semibold : .regular)
+                    let s = NSMutableAttributedString()
+                    for (c, cell) in row.enumerated() {
+                        if c > 0 { s.append(NSAttributedString(string: "\t", attributes: [.font: f])) }
+                        s.append(inline(cell, font: f, color: n == 0 ? th.strong : th.text, th))
+                    }
+                    let p = style(after: n == 0 ? 5 : 3)
+                    p.tabStops = (1..<cols).map { NSTextTab(textAlignment: .left, location: colW * CGFloat($0)) }
+                    add(s, p)
+                }
+                gap = true
+                continue
+            }
+            // Bullet list
+            if let r = line.range(of: #"^\s*[-*+•]\s+"#, options: .regularExpression) {
+                let x = depthAndX(line[r])
+                let s = NSMutableAttributedString(string: "•\t", attributes: [
+                    .font: NSFont.systemFont(ofSize: th.size, weight: .heavy), .foregroundColor: Theme.accent])
+                s.append(inline(String(line[r.upperBound...]), font: base, color: th.text, th))
+                add(s, style(indent: x + 16, first: x + 2, tab: x + 16))
+                i += 1; continue
+            }
+            // Numbered list
+            if let r = line.range(of: #"^\s*\d{1,3}[.)]\s+"#, options: .regularExpression) {
+                let x = depthAndX(line[r])
+                let s = NSMutableAttributedString(string: line[r].trimmingCharacters(in: .whitespaces) + "\t", attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: th.size, weight: .semibold), .foregroundColor: Theme.accent])
+                s.append(inline(String(line[r.upperBound...]), font: base, color: th.text, th))
+                add(s, style(indent: x + 24, first: x + 2, tab: x + 24))
+                i += 1; continue
+            }
+            // Plain paragraph (each line keeps its own line, as Claude wrote it)
+            add(inline(trimmed, font: base, color: th.text, th), style())
+            i += 1
+        }
+
+        let out = NSMutableAttributedString()
+        for (n, b) in blocks.enumerated() {
+            out.append(b)
+            if n < blocks.count - 1 {
+                let last = b.attributes(at: b.length - 1, effectiveRange: nil)
+                var a: [NSAttributedString.Key: Any] = [.font: last[.font] ?? base]
+                if let p = last[.paragraphStyle] { a[.paragraphStyle] = p }
+                out.append(NSAttributedString(string: "\n", attributes: a))
+            }
+        }
+        return out
+    }
+}
+
 // MARK: - Chats (memory length is a setting)
 
 struct Chat: Codable { var id: String; var title: String; var created: Date; var lastUsed: Date; var count: Int }
@@ -292,27 +545,6 @@ final class HistoryStore {
         let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
         try? enc.encode(entries).write(to: url, options: .atomic)
     }
-}
-
-/// Light markdown (bold, italic, code) as an attributed string, for the History window.
-func inlineMarkdown(_ md: String, size: CGFloat, color: NSColor) -> NSAttributedString {
-    let parsed = (try? AttributedString(markdown: md, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(md)
-    let out = NSMutableAttributedString()
-    let base = NSFont.systemFont(ofSize: size)
-    for run in parsed.runs {
-        var font = base
-        if let i = run.inlinePresentationIntent {
-            if i.contains(.code) { font = .monospacedSystemFont(ofSize: size - 1, weight: .regular) }
-            else {
-                var t: NSFontDescriptor.SymbolicTraits = []
-                if i.contains(.stronglyEmphasized) { t.insert(.bold) }
-                if i.contains(.emphasized) { t.insert(.italic) }
-                if !t.isEmpty { font = NSFont(descriptor: base.fontDescriptor.withSymbolicTraits(t), size: size) ?? base }
-            }
-        }
-        out.append(NSAttributedString(string: String(parsed[run.range].characters), attributes: [.font: font, .foregroundColor: color]))
-    }
-    return out
 }
 
 func chatMarkdown(_ items: [HistoryEntry]) -> String {
@@ -629,7 +861,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var historyWindow: HistoryWindowController?
     /// Session of the last answer (follow-ups continue it, even with chat memory off).
     var lastSessionID: String?
-    struct Shown { let header: String; let preview: String; let text: String; let mode: String; let footer: String; let replace: Bool; let chatID: String }
+    struct Shown {
+        let header: String; let preview: String; let text: String; let mode: String; let footer: String
+        let replace: Bool; let chatID: String
+        var entryID: String? = nil   // from History: show the chat up to this answer
+    }
+    struct Request { let prompt: String; let image: Bool; let preview: String; let followUp: String? }
+    /// The last question sent to Claude, for "Try again".
+    var lastRequest: Request?
+    var lastActivity = Date()
+    var pollCount = 0
     var lastShown: Shown?
     var testMode: String?
     var testTimingLog: Bool { CommandLine.arguments.contains("--interpret-clipboard") }
@@ -697,6 +938,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ n: Notification) { stopWarm() }
 
+    /// An accessory app shows no menu bar, but ⌘C, ⌘V, ⌘X, ⌘A and ⌘Z in text fields
+    /// only work if an Edit menu exists.
+    func installMainMenu() {
+        let main = NSMenu()
+        let editItem = NSMenuItem()
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+        main.addItem(editItem)
+        let winItem = NSMenuItem()
+        let win = NSMenu(title: "Window")
+        win.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        winItem.submenu = win
+        main.addItem(winItem)
+        NSApp.mainMenu = main
+    }
+
     func applicationDidFinishLaunching(_ n: Notification) {
         appDelegate = self
         try? FileManager.default.createDirectory(atPath: workDir, withIntermediateDirectories: true)
@@ -710,13 +974,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if enabled { startMonitoring() }
         refreshAuth()
         registerShowLastHotkey()
+        installMainMenu()
+        if let e = history.entries.last {   // so ⌥⌘2 and follow-ups work right after a restart
+            lastSessionID = e.chatID
+            if e.capture != "[image]" { lastCapture = Capture(text: e.capture, imagePath: nil, preview: e.capture) }
+            lastShown = shown(from: e)
+        }
         signal(SIGPIPE, SIG_IGN)  // a preloaded process may close its input
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.prewarm() }
         // First launch: a short guide (Claude Code, sign-in, TextSniper, a test).
         if !defaults.bool(forKey: "onboarded") && !CommandLine.arguments.contains(where: { $0.hasPrefix("--") }) || CommandLine.arguments.contains("--demo-welcome") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.openWelcome() }
         }
-        if CommandLine.arguments.contains("--demo") { demo() }
+        if ["--demo", "--demo-error", "--demo-md", "--demo-thread"].contains(where: CommandLine.arguments.contains) { demo() }
         // Testing without TextSniper: interpret what's on the clipboard, optionally in a mode,
         // then ask a follow-up. e.g. --interpret-clipboard --mode fix --follow-up "Why?"
         let a = CommandLine.arguments
@@ -754,20 +1024,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Preview the pop-up without calling Claude: `open ClaudeSniper.app --args --demo`
+    /// (also --demo-error, --demo-md for the Markdown sample, --demo-thread for a conversation).
     func demo() {
+        let a = CommandLine.arguments
         let q = "What is photosynthesis and why does it matter?"
         lastCapture = Capture(text: q, imagePath: nil, preview: q)
         popup.mode = "explain"
+        if a.contains("--demo-error") {
+            popup.show(header: header(), preview: q, state: .error("You're not signed in to Claude Code.\nSign in with your Claude account to continue."), footer: "")
+            return
+        }
+        let answer = """
+        **Photosynthesis** is the process plants, algae and some bacteria use to turn sunlight into chemical energy.
+
+        - **In:** light + water (`H₂O`) + carbon dioxide (`CO₂`)
+        - **Out:** glucose (food) + oxygen (`O₂`)
+
+        It matters because it produces *almost all the oxygen* we breathe and is the base of every food chain.
+        """
         popup.show(header: header(), preview: q, state: .loading, footer: "Starting a new chat…")
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-            self.popup.show(header: self.header(), preview: q, state: .result("""
-            **Photosynthesis** is the process plants, algae and some bacteria use to turn sunlight into chemical energy.
+            var text = answer
+            if a.contains("--demo-md") {
+                text = """
+                ## Binary search
 
-            - **In:** light + water (`H₂O`) + carbon dioxide (`CO₂`)
-            - **Out:** glucose (food) + oxygen (`O₂`)
+                It finds a value in a **sorted** list by halving the range each step:
 
-            It matters because it produces *almost all the oxygen* we breathe and is the base of every food chain.
-            """), footer: "Chat · 3 captures · expires in 15 min")
+                1. Look at the middle element.
+                2. If it's the target, stop.
+                3. Otherwise keep only the half that can contain it.
+
+                ```
+                def search(xs, target):
+                    lo, hi = 0, len(xs) - 1
+                    while lo <= hi:
+                        mid = (lo + hi) // 2
+                        if xs[mid] == target: return mid
+                        lo, hi = (mid + 1, hi) if xs[mid] < target else (lo, mid - 1)
+                    return -1
+                ```
+
+                | Items | Linear search | Binary search |
+                |---|---|---|
+                | 1,000 | 1,000 steps | 10 steps |
+                | 1,000,000 | 1,000,000 steps | 20 steps |
+
+                > It only works if the list is already sorted.
+                """
+                self.popup.mode = "auto"
+            }
+            if a.contains("--demo-thread") {
+                self.popup.thread = [
+                    HistoryEntry(chatID: "demo", mode: "Explain", model: "Haiku · low", capture: q, followUp: nil, answer: answer),
+                    HistoryEntry(chatID: "demo", mode: "Explain", model: "Haiku · low", capture: q, followUp: "Does it happen at night?",
+                                 answer: "Not the light-dependent part: without light there is no energy to split water. The **Calvin cycle** can keep running for a short while on stored ATP and NADPH."),
+                ]
+                self.popup.showThread = true
+                text = self.popup.thread[1].answer
+            }
+            self.popup.show(header: self.header(), preview: q, state: .result(text), footer: "Chat · 3 captures · 15 min left")
         }
     }
 
@@ -808,22 +1124,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Menu
 
+    var effortSeg: NSSegmentedControl?
+    var effortLabel: NSTextField?
+    var lastSeg: NSSegmentedControl?
+    var lastSegLabel: NSTextField?
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         refreshAuth()
         menu.removeAllItems()
         menu.addItem(viewItem(headerView()))
+        // Problems first, and only when there is one.
+        if findClaude() == nil {
+            menu.addItem(status(false, "Claude Code isn't installed · Set up…", action: #selector(openWelcome)))
+        } else if loggedIn == false {
+            menu.addItem(status(false, "Sign in to Claude…", action: #selector(login)))
+        }
         menu.addItem(.separator())
-        menu.addItem(viewItem(segmentView(title: "MODEL", opts: models, selected: model, action: #selector(modelChanged(_:)))))
-        menu.addItem(viewItem(segmentView(title: "EFFORT", opts: efforts, selected: effort, action: #selector(effortChanged(_:)))))
+
+        // How Claude answers
+        let fast = Settings.superFast
+        let fastOpt = Opt(id: "fast", label: "⚡ Fast", detail: "Super fast: Haiku with no extended thinking, from a Claude Code process that's already running. First words in about a second.")
+        menu.addItem(viewItem(segmentView(title: "MODEL", opts: [fastOpt] + models, selected: fast ? "fast" : model, action: #selector(modelChanged(_:)))))
+        menu.addItem(viewItem(segmentView(title: fast ? "EFFORT · not used in Fast" : "EFFORT", opts: efforts, selected: effort, action: #selector(effortChanged(_:)))))
+        effortSeg = lastSeg
+        effortLabel = lastSegLabel
+        effortSeg?.isEnabled = !fast
         menu.addItem(viewItem(modeView()))
         menu.addItem(myModesItem())
-        let fastItem = item("Super fast mode", "bolt.fill", #selector(toggleSuperFast))
-        fastItem.state = Settings.superFast ? .on : .off
-        fastItem.toolTip = "Haiku with no extended thinking, from a Claude Code process that's already waiting. Answers in about a second."
-        menu.addItem(fastItem)
-        if Settings.superFast {
-            for it in menu.items { it.view?.subviews.compactMap { $0 as? NSSegmentedControl }.filter { $0.action == #selector(modelChanged(_:)) || $0.action == #selector(effortChanged(_:)) }.forEach { $0.isEnabled = false } }
-        }
         let langItem = item("Answer in: \(isDemo ? "English" : label(languages, answerLanguage))", "globe", nil)
         let langMenu = NSMenu()
         for l in languages {
@@ -845,7 +1172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                   created: Date(), lastUsed: Date(), count: 3) : store.active
         if let c = shown {
             menu.addItem(info("bubble.left.and.bubble.right.fill", claudeOrange,
-                              "“\(c.title)”", "\(c.count) capture\(c.count == 1 ? "" : "s") · expires in \(ChatStore.minutesLeft(c)) min"))
+                              "“\(c.title)”", "\(c.count) capture\(c.count == 1 ? "" : "s") · \(ChatStore.minutesLeft(c)) min left"))
         } else {
             menu.addItem(info("bubble.left.and.bubble.right", .secondaryLabelColor,
                               "No active chat", "Your next capture starts a new one"))
@@ -860,7 +1187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             it.target = self
             it.representedObject = c.id
             it.state = c.id == store.activeID ? .on : .off
-            it.attributedTitle = twoLine(c.title, "\(c.count) capture\(c.count == 1 ? "" : "s") · \(ChatStore.ago(c.lastUsed)) · expires in \(ChatStore.minutesLeft(c)) min")
+            it.attributedTitle = twoLine(c.title, "\(c.count) capture\(c.count == 1 ? "" : "s") · \(ChatStore.ago(c.lastUsed)) · \(ChatStore.minutesLeft(c)) min left")
             sub.addItem(it)
         }
         if sub.items.isEmpty {
@@ -870,29 +1197,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         switchItem.submenu = sub
         menu.addItem(switchItem)
+        menu.addItem(.separator())
+
+        // Answers
         let last = item("Show last answer", "arrow.counterclockwise", #selector(showLast))
         last.keyEquivalent = "2"
         last.keyEquivalentModifierMask = [.option, .command]
+        last.isEnabled = lastShown != nil
         menu.addItem(last)
+        menu.addItem(item("History…", "clock.arrow.circlepath", #selector(openHistory)))
         let exportItem = item("Export chat", "square.and.arrow.up", nil)
         let em = NSMenu()
         em.addItem(item("As a Markdown file…", "doc.text", #selector(exportCurrentMarkdown)))
         em.addItem(item("To Apple Notes", "note.text", #selector(exportCurrentNotes)))
         exportItem.submenu = em
         menu.addItem(exportItem)
-        menu.addItem(item("History…", "clock.arrow.circlepath", #selector(openHistory)))
         menu.addItem(.separator())
 
-        // Status
-        if findClaude() == nil {
-            menu.addItem(status(false, "Claude Code is not installed", action: nil))
-        } else if loggedIn == true {
-            menu.addItem(status(true, "Connected to your Claude plan" + (account.isEmpty ? "" : " · \(account)"), action: nil))
-        } else {
-            menu.addItem(status(false, loggedIn == nil ? "Checking connection…" : "Sign in to Claude…", action: #selector(login)))
-        }
-        menu.addItem(status(true, "Watching for TextSniper captures", action: nil))
-        menu.addItem(.separator())
         menu.addItem(item("Interpret clipboard now", "wand.and.stars", #selector(testNow)))
         menu.addItem(settingsItem())
         menu.addItem(.separator())
@@ -947,6 +1268,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func headerView() -> NSView {
         let v = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 58))
+        let enabled = self.enabled || isDemo   // screenshots show it on
         let icon = NSImageView(image: Pixel.clawd(px: 2.5, on: enabled))
         icon.imageScaling = .scaleNone
         icon.frame = NSRect(x: 12, y: 14, width: 44, height: 30)
@@ -970,8 +1292,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let l = NSTextField(labelWithString: title)
         l.font = .systemFont(ofSize: 10, weight: .semibold)
         l.textColor = .secondaryLabelColor
-        l.frame = NSRect(x: 14, y: 32, width: 120, height: 14)
+        l.frame = NSRect(x: 14, y: 32, width: menuWidth - 28, height: 14)
         let seg = NSSegmentedControl(labels: opts.map { $0.label }, trackingMode: .selectOne, target: self, action: action)
+        lastSeg = seg
+        lastSegLabel = l
         seg.controlSize = .small
         seg.segmentDistribution = .fillEqually
         seg.selectedSegment = opts.firstIndex { $0.id == selected } ?? 0
@@ -1093,8 +1417,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         miniPending = nil
         popup.mode = s.mode
         popup.allowReplace = s.replace
-        popup.thread = history.chat(s.chatID)
+        var chat = history.chat(s.chatID)
+        if let id = s.entryID, let i = chat.firstIndex(where: { $0.id == id }) { chat = Array(chat[...i]) }
+        popup.thread = chat
         popup.show(header: s.header, preview: s.preview, state: .result(s.text), footer: s.footer)
+    }
+
+    /// A saved answer, ready to show in the pop-up again.
+    func shown(from e: HistoryEntry) -> Shown {
+        let m = builtInModes.first { $0.label == e.mode }?.id ?? (customModes.contains { $0.name == e.mode } ? "custom:" + e.mode : "auto")
+        let footer = store.active?.id == e.chatID ? chatFooter() : "From History · follow-ups continue this chat"
+        return Shown(header: e.model, preview: e.followUp.map { "↳ " + $0 } ?? e.capture, text: e.answer, mode: m,
+                     footer: footer, replace: e.followUp == nil, chatID: e.chatID, entryID: e.id)
+    }
+
+    /// History → "Open in pop-up": shows the answer; follow-up questions continue that chat.
+    func openFromHistory(_ e: HistoryEntry) {
+        lastSessionID = e.chatID
+        if e.capture != "[image]" { lastCapture = Capture(text: e.capture, imagePath: nil, preview: e.capture) }
+        lastShown = shown(from: e)
+        popup.showThread = false
+        showLast()
+    }
+
+    func retryLast() {
+        guard let r = lastRequest else { return }
+        ask(prompt: r.prompt, image: r.image, preview: r.preview, followUp: r.followUp)
     }
 
     var welcome: WelcomeWindowController?
@@ -1185,6 +1533,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func settingsItem() -> NSMenuItem {
         let s = item("Settings", "gearshape", nil)
         let m = NSMenu()
+        if loggedIn == true {
+            let acct = NSMenuItem(title: "Signed in to Claude" + (account.isEmpty ? "" : " · \(account)"), action: nil, keyEquivalent: "")
+            acct.image = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(paletteColors: [.systemGreen]))
+            m.addItem(acct)
+            m.addItem(.separator())
+        }
         m.addItem(choiceMenu("Chat memory", "clock.arrow.circlepath", key: "chatMinutes", options: chatMemoryOptions,
                              isOn: { ($0 as? Int) == Settings.chatMinutes }))
         m.addItem(choiceMenu("Answer length", "text.alignleft", key: "answerLength", options: lengthOptions,
@@ -1196,7 +1551,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.addItem(.separator())
         m.addItem(toggle("Copy the answer automatically", "doc.on.clipboard", key: "autoCopy"))
         m.addItem(toggle("Play a sound when the answer arrives", "speaker.wave.2", key: "sound"))
-        m.addItem(toggle("Mini Clawd mode: answers wait in a tiny Clawd", "face.smiling", key: "miniMode"))
+        m.addItem(toggle("Mini Clawd: answers wait in a tiny Clawd", "face.smiling", key: "miniMode"))
         if AXIsProcessTrusted() {
             let ap = NSMenuItem(title: "Auto-paste for Replace is on", action: nil, keyEquivalent: "")
             ap.image = NSImage(systemSymbolName: "checkmark.circle", accessibilityDescription: nil)
@@ -1286,7 +1641,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         enabled = s.state == .on
         if let m = statusItem.menu, let first = m.items.first { first.view = headerView() }
     }
-    @objc func modelChanged(_ s: NSSegmentedControl) { defaults.set(models[s.selectedSegment].id, forKey: "model") }
+    /// The first segment is ⚡ Fast (Super fast mode); the rest are the models.
+    @objc func modelChanged(_ s: NSSegmentedControl) {
+        let fast = s.selectedSegment == 0
+        defaults.set(fast, forKey: "superFast")
+        if fast { prewarm() } else {
+            defaults.set(models[s.selectedSegment - 1].id, forKey: "model")
+            stopWarm()
+        }
+        effortSeg?.isEnabled = !fast
+        effortLabel?.stringValue = fast ? "EFFORT · not used in Fast" : "EFFORT"
+    }
     @objc func effortChanged(_ s: NSSegmentedControl) { defaults.set(efforts[s.selectedSegment].id, forKey: "effort") }
     @objc func testNow() { handleClipboard() }
     @objc func newChat() { store.newChat() }
@@ -1317,8 +1682,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(URL(fileURLWithPath: path))
     }
 
+    var lastAuthCheck = Date.distantPast
+
+    /// Asks Claude Code whether you're signed in. From the menu, at most once a minute.
     func refreshAuth(_ done: ((Bool) -> Void)? = nil) {
         guard let claude = findClaude() else { done?(false); return }
+        if done == nil && loggedIn == true && Date().timeIntervalSince(lastAuthCheck) < 60 { return }
+        lastAuthCheck = Date()
         DispatchQueue.global().async {
             let out = runSync(claude, ["auth", "status"], stdin: nil, timeout: 20).output
             var ok = false, acct = ""
@@ -1362,9 +1732,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard enabled else { return }
         lastChange = NSPasteboard.general.changeCount
         armedUntil = Date().addingTimeInterval(30)  // time to select the area
+        lastActivity = Date()
+        prewarm()   // Super fast: get a process ready while you select
     }
 
     func poll() {
+        pollCount += 1
+        if pollCount % 150 == 0 { tidyWarm() }   // every 30 s
         if tap == nil && CGPreflightListenEventAccess() { installTap() }
         let c = NSPasteboard.general.changeCount
         guard c != lastChange else { return }
@@ -1398,7 +1772,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func chatFooter() -> String {
         if let c = store.active {
-            return "Chat · \(c.count) capture\(c.count == 1 ? "" : "s") · expires in \(ChatStore.minutesLeft(c)) min"
+            return "Chat · \(c.count) capture\(c.count == 1 ? "" : "s") · \(ChatStore.minutesLeft(c)) min left"
         }
         return Settings.chatMinutes == 0 ? "Chat memory is off" : "New chat · your next capture starts fresh"
     }
@@ -1439,7 +1813,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func header() -> String {
-        Settings.superFast ? "Haiku · ⚡ super fast" : "\(label(models, model)) · \(label(efforts, effort).lowercased())"
+        Settings.superFast ? "⚡ Fast · Haiku" : "\(label(models, model)) · \(label(efforts, effort).lowercased())"
     }
 
     func ask(prompt: String, image: Bool, preview: String, followUp: String? = nil, allowWarm: Bool = true, retried: Bool = false) {
@@ -1450,6 +1824,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         current?.process.terminate()
         current = nil
         requestID += 1
+        lastRequest = Request(prompt: prompt, image: image, preview: preview, followUp: followUp)
+        lastActivity = Date()
         // Mini Clawd: only when the pop-up isn't already open (re-runs and follow-ups stay in it).
         miniThisRequest = Settings.miniMode && !popup.panel.isVisible
         let myID = requestID
@@ -1516,7 +1892,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.ask(prompt: prompt, image: image, preview: preview, followUp: followUp)  // retry in a new chat
             } else if all.contains("authenticate") || all.contains("/login") || all.contains("401") {
                 self.loggedIn = false
-                self.display(header: hdr, preview: preview, state: .error("You're not signed in to Claude Code.\nOpen the menu bar menu → “Sign in to Claude…”."), footer: "")
+                self.display(header: hdr, preview: preview, state: .error("You're not signed in to Claude Code.\nSign in with your Claude account to continue."), footer: "")
             } else if !retried {
                 // A hiccup (e.g. the session was busy for a moment): try once more the normal way.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -1593,6 +1969,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         spareWarm = WarmProcess(sessionID: UUID().uuidString.lowercased(), resume: false, systemPrompt: sys)
     }
 
+    /// Preloaded processes use memory: stop the chat's one when the chat expires, and the
+    /// spare after 10 minutes without captures (the next answer then starts one again).
+    func tidyWarm() {
+        if let w = chatWarm, !w.busy, store.active?.id != w.sessionID { w.stop(); chatWarm = nil }
+        if let s = spareWarm, !s.busy, Date().timeIntervalSince(lastActivity) > 600 { s.stop(); spareWarm = nil }
+    }
+
     func stopWarm() {
         chatWarm?.stop(); spareWarm?.stop()
         chatWarm = nil; spareWarm = nil
@@ -1615,11 +1998,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return w
     }
 
-    @objc func toggleSuperFast() {
-        defaults.set(!Settings.superFast, forKey: "superFast")
-        Settings.superFast ? prewarm() : stopWarm()
-    }
-
     /// A question about the last answer, typed in the pop-up (tab).
     func followUp(_ q: String) {
         let prompt = "Follow-up question about the previous capture. Answer it directly, with the same language and style rules:\n\n\(q)"
@@ -1634,8 +2012,6 @@ final class KeyPanel: NSPanel {
     override func cancelOperation(_ sender: Any?) { orderOut(nil) }
 }
 
-final class FlippedView: NSView { override var isFlipped: Bool { true } }
-
 /// Presses ⌘V in the front app (needs Accessibility permission).
 func pasteKeystroke() {
     let src = CGEventSource(stateID: .combinedSessionState)
@@ -1647,41 +2023,58 @@ func pasteKeystroke() {
     up?.post(tap: .cghidEventTap)
 }
 
+/// The answer pop-up.
+///
+///   [Clawd] Claude (model)                         [pin] [more] [close]
+///   ▎ what you captured
+///   (Auto) (Explain) (Translate) (Summarize) (Solve) (Fix) (★ yours)
+///   the answer…
+///   ─────────────────────────────────────────────────────────────────
+///   Chat · 3 captures · 15 min left ›         [Ask ⇥] [Replace ⌘↩] [Copy ⌘C]
 final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
     enum State { case loading, streaming(String), result(String), error(String) }
 
     let width: CGFloat = 600
     let panel: KeyPanel
+    // Header
     let clawdView = NSImageView()
     let titleLabel = NSTextField(labelWithString: "Claude")
     let chip = NSTextField(labelWithString: "")
+    var stopBtn: HoverButton!     // only while reading aloud
+    var pinBtn: HoverButton!
+    var moreBtn: HoverButton!
+    // Capture
     let quoteBox = NSView()
     let quoteBar = NSView()
     let quoteLabel = NSTextField(wrappingLabelWithString: "")
+    // Modes
+    let modeBar = NSStackView()
+    var modeButtons: [HoverButton] = []
+    var customPill: HoverButton!
+    // Answer
     let scroll = NSScrollView()
     let textView = NSTextView()
-    let footerLabel = NSTextField(labelWithString: "")
-    let hintLabel = NSTextField(labelWithString: "1–6 modes · tab ask · esc close")
+    // Bottom bar
+    let statusBtn = HoverButton()
+    let actions = NSStackView()
     let askField = NSTextField()
-    var copyBtn: NSButton!
-    var newBtn: NSButton!
-    var replaceBtn: NSButton!
-    var pinBtn: NSButton!
-    /// Pinned: the pop-up doesn't close by itself or with esc (only with ✕).
-    var pinned = false
-    var speakBtn: NSButton!
-    var askBtn: NSButton!
+    var askBtn: HoverButton!
+    var copyBtn: HoverButton!
+    var replaceBtn: HoverButton!
+    var retryBtn: HoverButton!
+    var fixBtn: HoverButton!      // "Sign in…" or "Set up…" on errors
+
     let frames = Pixel.clawdFrames(px: 2)
     let idleImage = Pixel.clawd(px: 2)
     var frameIdx = 0
     var animTimer: Timer?
-    var dots = 0
+    var loadingSince = Date()
     var streamingNow = false
     var resultText = ""
+    var errorMessage = ""
+    var isError = false
+    var footerText = ""
     var keyMonitor: Any?
-    let modeBar = NSStackView()
-    var modeButtons: [NSButton] = []
-    var customPill: NSButton!
     var mode = "auto" { didSet { refreshModeBar() } }
     /// False for follow-up answers: Replace would paste an explanation, not the fixed text.
     var allowReplace = true
@@ -1689,9 +2082,16 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
     var thread: [HistoryEntry] = []
     /// Show the whole conversation instead of only the last answer.
     var showThread = false
-    var threadBtn: NSButton!
+    /// Pinned: the pop-up doesn't close by itself or with esc (only with ✕).
+    var pinned = false
     var lastArgs: (header: String, preview: String, footer: String)?
     let speech = AVSpeechSynthesizer()
+    // Streaming is drawn at most ~30 times a second.
+    var pendingStream: (String, String, State, String)?
+    var streamTimer: Timer?
+    var lastStreamRender = Date.distantPast
+
+    var done: Bool { !resultText.isEmpty && !streamingNow && !isError }
 
     override init() {
         panel = KeyPanel(contentRect: NSRect(x: 0, y: 0, width: 600, height: 220),
@@ -1713,82 +2113,51 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         bg.material = .hudWindow
         bg.state = .active
         bg.blendingMode = .behindWindow
-        bg.maskImage = Self.roundedMask(18)
+        bg.maskImage = Self.roundedMask(Theme.radius)
         panel.contentView = bg
 
-        let border = NSView()
-        border.wantsLayer = true
-        border.layer?.cornerRadius = 18
-        border.layer?.borderWidth = 1
-        border.layer?.borderColor = NSColor.white.withAlphaComponent(0.10).cgColor
+        // A warm dark tint over the blur keeps the text readable on bright backgrounds.
+        let tint = NSView()
+        tint.wantsLayer = true
+        tint.layer?.backgroundColor = NSColor(srgbRed: 0.10, green: 0.08, blue: 0.075, alpha: 0.5).cgColor
+        tint.layer?.cornerRadius = Theme.radius
+        tint.layer?.borderWidth = 1
+        tint.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
 
         clawdView.image = idleImage
         clawdView.imageScaling = .scaleNone
-
         titleLabel.font = .systemFont(ofSize: 14, weight: .bold)
         titleLabel.textColor = .white
-
         chip.font = .systemFont(ofSize: 10.5, weight: .semibold)
-        chip.textColor = claudeOrange
+        chip.textColor = Theme.accentSoft
         chip.wantsLayer = true
-        chip.layer?.backgroundColor = claudeOrange.withAlphaComponent(0.16).cgColor
-        chip.layer?.cornerRadius = 8
+        chip.layer?.backgroundColor = Theme.accent.withAlphaComponent(0.18).cgColor
+        chip.layer?.cornerRadius = 9
 
-        replaceBtn = iconButton("text.insert", "Replace: paste this where you captured it", #selector(replaceResult))
-        speakBtn = iconButton("speaker.wave.2", "Read aloud", #selector(speak))
-        askBtn = iconButton("text.bubble", "Ask a follow-up (tab)", #selector(showAsk))
-        copyBtn = iconButton("doc.on.doc", "Copy answer", #selector(copyResult))
-        newBtn = iconButton("square.and.pencil", "New chat", #selector(newChat))
+        stopBtn = iconButton("stop.fill", "Stop reading aloud", #selector(speak))
+        stopBtn.contentTintColor = Theme.accent
+        stopBtn.isHidden = true
+        pinBtn = iconButton("pin", "Keep this pop-up open (⌘P)", #selector(togglePin))
+        moreBtn = iconButton("ellipsis", "More", #selector(showMore(_:)))
         let closeBtn = iconButton("xmark", "Close (esc)", #selector(close))
-        pinBtn = iconButton("pin", "Pin: keep this pop-up open", #selector(togglePin))
-        threadBtn = iconButton("rectangle.stack", "Show the whole conversation", #selector(toggleThread))
-        let buttons = NSStackView(views: [threadBtn, pinBtn, replaceBtn, speakBtn, askBtn, copyBtn, newBtn, closeBtn])
-        buttons.orientation = .horizontal
-        buttons.spacing = 2
+        let headerButtons = NSStackView(views: [stopBtn, pinBtn, moreBtn, closeBtn])
+        headerButtons.orientation = .horizontal
+        headerButtons.spacing = 2
 
         quoteBox.wantsLayer = true
-        quoteBox.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.06).cgColor
-        quoteBox.layer?.cornerRadius = 8
+        quoteBox.layer?.backgroundColor = Theme.fill.cgColor
+        quoteBox.layer?.cornerRadius = 9
         quoteBar.wantsLayer = true
-        quoteBar.layer?.backgroundColor = claudeOrange.cgColor
+        quoteBar.layer?.backgroundColor = Theme.accent.cgColor
         quoteBar.layer?.cornerRadius = 1.5
         quoteLabel.font = .systemFont(ofSize: 12)
-        quoteLabel.textColor = NSColor.white.withAlphaComponent(0.6)
+        quoteLabel.textColor = Theme.ink2
         quoteLabel.maximumNumberOfLines = 2
         quoteLabel.lineBreakMode = .byTruncatingTail
         quoteLabel.cell?.truncatesLastVisibleLine = true
 
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.drawsBackground = false
-        textView.textContainerInset = NSSize(width: 0, height: 2)
-        textView.isVerticallyResizable = true
-        textView.autoresizingMask = [.width]
-        textView.textContainer?.widthTracksTextView = true
-        textView.linkTextAttributes = [.foregroundColor: claudeOrange]
-        scroll.documentView = textView
-        scroll.drawsBackground = false
-        scroll.hasVerticalScroller = true
-        scroll.autohidesScrollers = true
-        scroll.scrollerStyle = .overlay
-
-        footerLabel.font = .systemFont(ofSize: 10.5, weight: .medium)
-        footerLabel.textColor = NSColor.white.withAlphaComponent(0.45)
-        hintLabel.font = .systemFont(ofSize: 10.5)
-        hintLabel.textColor = NSColor.white.withAlphaComponent(0.3)
-
-        askField.placeholderString = "Ask a follow-up…   ↩ send · esc cancel"
-        askField.font = .systemFont(ofSize: 12.5)
-        askField.bezelStyle = .roundedBezel
-        askField.focusRingType = .none
-        askField.isHidden = true
-        askField.target = self
-        askField.action = #selector(askSubmitted)
-
-        let divider = NSBox(); divider.boxType = .separator
-
         modeBar.orientation = .horizontal
-        modeBar.spacing = 4
+        modeBar.spacing = 5
         modeBar.alignment = .centerY
         for (i, m) in builtInModes.enumerated() {
             let b = pill(m.label, m.symbol, #selector(modeClicked(_:)))
@@ -1802,16 +2171,63 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         modeBar.addArrangedSubview(customPill)
         refreshModeBar()
 
-        let all: [NSView] = [border, clawdView, titleLabel, chip, buttons,
-                             quoteBox, modeBar, scroll, divider, footerLabel, hintLabel, askField]
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 0, height: 2)
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.linkTextAttributes = [.foregroundColor: Theme.accentSoft, .underlineStyle: NSUnderlineStyle.single.rawValue]
+        scroll.documentView = textView
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+
+        let divider = NSView()
+        divider.wantsLayer = true
+        divider.layer?.backgroundColor = Theme.stroke.cgColor
+
+        statusBtn.isBordered = false
+        statusBtn.apply()
+        statusBtn.target = self
+        statusBtn.action = #selector(toggleThread)
+        statusBtn.alignment = .left
+        statusBtn.layer?.cornerRadius = 6
+        statusBtn.cell?.lineBreakMode = .byTruncatingTail
+        statusBtn.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        statusBtn.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+
+        askBtn = actionButton("Ask", "⇥", #selector(showAsk))
+        askBtn.toolTip = "Ask a follow-up in the same chat"
+        replaceBtn = actionButton("Replace", "⌘↩", #selector(replaceResult), primary: true)
+        replaceBtn.toolTip = "Paste this where you captured it"
+        copyBtn = actionButton("Copy", "⌘C", #selector(copyResult))
+        retryBtn = actionButton("Try again", "", #selector(retry))
+        fixBtn = actionButton("Sign in…", "", #selector(fixProblem), primary: true)
+        for b in [retryBtn, fixBtn, askBtn, replaceBtn, copyBtn] as [NSView] { actions.addArrangedSubview(b) }
+        actions.orientation = .horizontal
+        actions.spacing = 6
+
+        askField.placeholderString = "Ask a follow-up…   ↩ send · esc cancel"
+        askField.font = .systemFont(ofSize: 12.5)
+        askField.bezelStyle = .roundedBezel
+        askField.focusRingType = .none
+        askField.isHidden = true
+        askField.target = self
+        askField.action = #selector(askSubmitted)
+
+        let all: [NSView] = [tint, clawdView, titleLabel, chip, headerButtons, quoteBox, modeBar,
+                             scroll, divider, statusBtn, actions, askField]
         for v in all { v.translatesAutoresizingMaskIntoConstraints = false; bg.addSubview(v) }
         for v in [quoteBar, quoteLabel] { v.translatesAutoresizingMaskIntoConstraints = false; quoteBox.addSubview(v) }
 
         NSLayoutConstraint.activate([
-            border.topAnchor.constraint(equalTo: bg.topAnchor),
-            border.bottomAnchor.constraint(equalTo: bg.bottomAnchor),
-            border.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
-            border.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
+            tint.topAnchor.constraint(equalTo: bg.topAnchor),
+            tint.bottomAnchor.constraint(equalTo: bg.bottomAnchor),
+            tint.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
+            tint.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
 
             clawdView.topAnchor.constraint(equalTo: bg.topAnchor, constant: 14),
             clawdView.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 16),
@@ -1821,12 +2237,11 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
             titleLabel.centerYAnchor.constraint(equalTo: clawdView.centerYAnchor),
             chip.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 8),
             chip.centerYAnchor.constraint(equalTo: clawdView.centerYAnchor),
-            chip.heightAnchor.constraint(equalToConstant: 17),
+            chip.heightAnchor.constraint(equalToConstant: 18),
+            headerButtons.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -10),
+            headerButtons.centerYAnchor.constraint(equalTo: clawdView.centerYAnchor),
 
-            buttons.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -12),
-            buttons.centerYAnchor.constraint(equalTo: clawdView.centerYAnchor),
-
-            quoteBox.topAnchor.constraint(equalTo: clawdView.bottomAnchor, constant: 14),
+            quoteBox.topAnchor.constraint(equalTo: clawdView.bottomAnchor, constant: 12),
             quoteBox.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 16),
             quoteBox.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -16),
             quoteBar.leadingAnchor.constraint(equalTo: quoteBox.leadingAnchor, constant: 8),
@@ -1840,91 +2255,69 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
 
             modeBar.topAnchor.constraint(equalTo: quoteBox.bottomAnchor, constant: 10),
             modeBar.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 16),
-            modeBar.heightAnchor.constraint(equalToConstant: 22),
+            modeBar.heightAnchor.constraint(equalToConstant: 24),
+
             scroll.topAnchor.constraint(equalTo: modeBar.bottomAnchor, constant: 12),
-            scroll.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 16),
-            scroll.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -12),
+            scroll.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 18),
+            scroll.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -10),
             scroll.bottomAnchor.constraint(equalTo: divider.topAnchor, constant: -10),
 
-            divider.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 16),
-            divider.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -16),
-            divider.bottomAnchor.constraint(equalTo: footerLabel.topAnchor, constant: -9),
-            footerLabel.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 16),
-            footerLabel.bottomAnchor.constraint(equalTo: bg.bottomAnchor, constant: -11),
-            hintLabel.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -16),
-            hintLabel.centerYAnchor.constraint(equalTo: footerLabel.centerYAnchor),
-            askField.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 14),
-            askField.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -14),
-            askField.centerYAnchor.constraint(equalTo: footerLabel.centerYAnchor),
+            divider.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 1),
+            divider.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -1),
+            divider.heightAnchor.constraint(equalToConstant: 1),
+            divider.bottomAnchor.constraint(equalTo: bg.bottomAnchor, constant: -44),
+
+            statusBtn.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 10),
+            statusBtn.centerYAnchor.constraint(equalTo: bg.bottomAnchor, constant: -22),
+            statusBtn.heightAnchor.constraint(equalToConstant: 26),
+            statusBtn.trailingAnchor.constraint(lessThanOrEqualTo: actions.leadingAnchor, constant: -8),
+            actions.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -10),
+            actions.centerYAnchor.constraint(equalTo: statusBtn.centerYAnchor),
+            askField.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 12),
+            askField.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -12),
+            askField.centerYAnchor.constraint(equalTo: statusBtn.centerYAnchor),
         ])
 
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard let self, self.panel.isKeyWindow else { return e }
-            let asking = !self.askField.isHidden
-            if e.keyCode == UInt16(kVK_Escape) {
-                if asking { self.hideAsk() } else if self.pinned { NSSound.beep() } else { self.close() }
-                return nil
-            }
-            if asking { return e }
-            if e.keyCode == UInt16(kVK_Tab) && !self.resultText.isEmpty && !self.streamingNow { self.showAsk(); return nil }
+            return self.handleKey(e) ? nil : e
+        }
+    }
+
+    /// Keyboard: esc, tab, 1–9, and ⌘C / ⌘↩ / ⌘N / ⌘T / ⌘P / ⌘R / ⌘W. Returns true if handled.
+    func handleKey(_ e: NSEvent) -> Bool {
+        let asking = !askField.isHidden
+        if e.keyCode == UInt16(kVK_Escape) {
+            if asking { hideAsk() } else if pinned { NSSound.beep() } else { close() }
+            return true
+        }
+        if asking { return false }
+        let mods = e.modifierFlags.intersection([.command, .control, .option, .shift])
+        let ch = e.charactersIgnoringModifiers?.lowercased() ?? ""
+        if mods.isEmpty {
+            if e.keyCode == UInt16(kVK_Tab) { if done { showAsk() }; return true }
             let modes = allModes()
-            if e.modifierFlags.intersection([.command, .control, .option]).isEmpty,
-               let ch = e.charactersIgnoringModifiers, let n = Int(ch), (1...modes.count).contains(n) {
-                appDelegate?.rerun(modeID: modes[n - 1].id); return nil
-            }
-            return e
+            if let n = Int(ch), (1...modes.count).contains(n) { appDelegate?.rerun(modeID: modes[n - 1].id); return true }
+            return false
+        }
+        guard mods == .command else { return false }
+        if e.keyCode == UInt16(kVK_Return) { if !replaceBtn.isHidden { replaceResult() }; return true }
+        switch ch {
+        case "c":
+            // With a selection, ⌘C copies the selection; otherwise the whole answer.
+            if textView.selectedRange().length > 0 { return false }
+            if done { copyResult() }
+            return true
+        case "n": newChat(); return true
+        case "t": toggleThread(); return true
+        case "p": togglePin(); return true
+        case "r": speak(); return true
+        case "w": close(); return true
+        default: return false
         }
     }
 
-    func pill(_ title: String, _ symbol: String, _ action: Selector) -> NSButton {
-        let b = NSButton(title: title, image: NSImage(systemSymbolName: symbol, accessibilityDescription: title)!,
-                         target: self, action: action)
-        b.isBordered = false
-        b.imagePosition = .imageLeading
-        b.imageHugsTitle = true
-        b.font = .systemFont(ofSize: 11, weight: .medium)
-        b.symbolConfiguration = .init(pointSize: 10, weight: .semibold)
-        b.wantsLayer = true
-        b.layer?.cornerRadius = 11
-        b.translatesAutoresizingMaskIntoConstraints = false
-        b.heightAnchor.constraint(equalToConstant: 22).isActive = true
-        return b
-    }
-
-    func style(_ b: NSButton, _ title: String, on: Bool) {
-        b.layer?.backgroundColor = (on ? claudeOrange.withAlphaComponent(0.25) : NSColor.white.withAlphaComponent(0.06)).cgColor
-        b.layer?.borderWidth = on ? 1 : 0
-        b.layer?.borderColor = claudeOrange.withAlphaComponent(0.6).cgColor
-        b.contentTintColor = on ? claudeOrange : NSColor.white.withAlphaComponent(0.7)
-        b.attributedTitle = NSAttributedString(string: " " + title, attributes: [
-            .font: NSFont.systemFont(ofSize: 11, weight: on ? .semibold : .medium),
-            .foregroundColor: on ? claudeOrange : NSColor.white.withAlphaComponent(0.7)])
-        b.constraints.filter { $0.firstAttribute == .width }.forEach { b.removeConstraint($0) }
-        b.widthAnchor.constraint(equalToConstant: b.intrinsicContentSize.width + 12).isActive = true
-    }
-
-    func refreshModeBar() {
-        for (i, b) in modeButtons.enumerated() { style(b, builtInModes[i].label, on: builtInModes[i].id == mode) }
-        let custom = customModes
-        customPill.isHidden = custom.isEmpty
-        let isCustom = mode.hasPrefix("custom:")
-        style(customPill, isCustom ? String(mode.dropFirst(7)) + " ▾" : "My modes ▾", on: isCustom)
-    }
-
-    @objc func modeClicked(_ b: NSButton) { appDelegate?.rerun(modeID: builtInModes[b.tag].id) }
-
-    @objc func customPillClicked(_ b: NSButton) {
-        let m = NSMenu()
-        for (i, c) in customModes.enumerated() {
-            let it = NSMenuItem(title: "\(c.name)   key \(builtInModes.count + i + 1)", action: #selector(customChosen(_:)), keyEquivalent: "")
-            it.target = self
-            it.representedObject = "custom:" + c.name
-            it.state = mode == "custom:" + c.name ? .on : .off
-            m.addItem(it)
-        }
-        m.popUp(positioning: nil, at: NSPoint(x: 0, y: b.bounds.height + 4), in: b)
-    }
-    @objc func customChosen(_ i: NSMenuItem) { if let id = i.representedObject as? String { appDelegate?.rerun(modeID: id) } }
+    // MARK: Building blocks
 
     static func roundedMask(_ r: CGFloat) -> NSImage {
         let img = NSImage(size: NSSize(width: 2 * r + 1, height: 2 * r + 1), flipped: false) { rect in
@@ -1937,67 +2330,203 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         return img
     }
 
-    func iconButton(_ symbol: String, _ tip: String, _ action: Selector) -> NSButton {
-        let b = NSButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: tip)!, target: self, action: action)
+    func iconButton(_ symbol: String, _ tip: String, _ action: Selector) -> HoverButton {
+        let b = HoverButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: tip)!, target: self, action: action)
         b.isBordered = false
-        b.bezelStyle = .accessoryBarAction
-        b.contentTintColor = NSColor.white.withAlphaComponent(0.6)
+        b.contentTintColor = Theme.ink2
         b.toolTip = tip
-        b.symbolConfiguration = .init(pointSize: 12, weight: .medium)
-        b.widthAnchor.constraint(equalToConstant: 26).isActive = true
-        b.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        b.symbolConfiguration = .init(pointSize: 12, weight: .semibold)
+        b.apply()
+        b.layer?.cornerRadius = 6
+        b.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        b.heightAnchor.constraint(equalToConstant: 24).isActive = true
         return b
     }
 
-    func setAnswerButtons(visible: Bool) {
-        copyBtn.isHidden = !visible
-        threadBtn.isHidden = !(visible && thread.count > 1)
-        speakBtn.isHidden = !visible
-        askBtn.isHidden = !visible
-        replaceBtn.isHidden = !(visible && allowReplace && replaceableModes.contains(mode))
+    func pill(_ title: String, _ symbol: String, _ action: Selector) -> HoverButton {
+        let b = HoverButton(title: title, image: NSImage(systemSymbolName: symbol, accessibilityDescription: title)!,
+                            target: self, action: action)
+        b.isBordered = false
+        b.imagePosition = .imageLeading
+        b.imageHugsTitle = true
+        b.symbolConfiguration = .init(pointSize: 10, weight: .semibold)
+        b.apply()
+        b.layer?.cornerRadius = 12
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        return b
     }
 
+    func style(_ b: HoverButton, _ title: String, on: Bool) {
+        b.normalBg = on ? Theme.accent.withAlphaComponent(0.24) : Theme.fill
+        b.hoverBg = on ? Theme.accent.withAlphaComponent(0.32) : Theme.fillHover
+        b.layer?.borderWidth = on ? 1 : 0
+        b.layer?.borderColor = Theme.accent.withAlphaComponent(0.6).cgColor
+        b.contentTintColor = on ? Theme.accentSoft : Theme.ink2
+        b.attributedTitle = NSAttributedString(string: " " + title, attributes: [
+            .font: NSFont.systemFont(ofSize: 11.5, weight: on ? .semibold : .medium),
+            .foregroundColor: on ? Theme.accentSoft : NSColor.white.withAlphaComponent(0.78)])
+        b.constraints.filter { $0.firstAttribute == .width }.forEach { b.removeConstraint($0) }
+        b.widthAnchor.constraint(equalToConstant: b.intrinsicContentSize.width + 14).isActive = true
+    }
+
+    /// A labeled button for the bottom bar, with its shortcut shown dimmed.
+    func actionButton(_ title: String, _ key: String, _ action: Selector, primary: Bool = false) -> HoverButton {
+        let b = HoverButton(title: title, target: self, action: action)
+        b.isBordered = false
+        b.normalBg = primary ? Theme.accent.withAlphaComponent(0.92) : Theme.fill
+        b.hoverBg = primary ? Theme.accent : Theme.fillHover
+        b.layer?.cornerRadius = 7
+        setTitle(b, title, key, primary: primary)
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        return b
+    }
+
+    func setTitle(_ b: HoverButton, _ title: String, _ key: String, primary: Bool = false) {
+        let s = NSMutableAttributedString(string: title, attributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: NSColor.white.withAlphaComponent(primary ? 1 : 0.9)])
+        if !key.isEmpty {
+            s.append(NSAttributedString(string: "  " + key, attributes: [
+                .font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: NSColor.white.withAlphaComponent(primary ? 0.7 : 0.4)]))
+        }
+        b.attributedTitle = s
+        b.constraints.filter { $0.firstAttribute == .width }.forEach { b.removeConstraint($0) }
+        b.widthAnchor.constraint(equalToConstant: ceil(s.size().width) + 22).isActive = true
+    }
+
+    func refreshModeBar() {
+        for (i, b) in modeButtons.enumerated() { style(b, builtInModes[i].label, on: builtInModes[i].id == mode) }
+        customPill.isHidden = customModes.isEmpty
+        let isCustom = mode.hasPrefix("custom:")
+        style(customPill, isCustom ? String(mode.dropFirst(7)) + " ▾" : "My modes ▾", on: isCustom)
+    }
+
+    @objc func modeClicked(_ b: NSButton) { appDelegate?.rerun(modeID: builtInModes[b.tag].id) }
+
+    @objc func customPillClicked(_ b: NSButton) {
+        let m = NSMenu()
+        m.appearance = NSAppearance(named: .darkAqua)
+        for (i, c) in customModes.enumerated() {
+            let it = NSMenuItem(title: "\(c.name)   key \(builtInModes.count + i + 1)", action: #selector(customChosen(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = "custom:" + c.name
+            it.state = mode == "custom:" + c.name ? .on : .off
+            m.addItem(it)
+        }
+        m.popUp(positioning: nil, at: NSPoint(x: 0, y: b.bounds.height + 4), in: b)
+    }
+    @objc func customChosen(_ i: NSMenuItem) { if let id = i.representedObject as? String { appDelegate?.rerun(modeID: id) } }
+
+    /// The "more" menu: everything that isn't worth a permanent button.
+    @objc func showMore(_ b: NSButton) {
+        let m = NSMenu()
+        m.autoenablesItems = false
+        m.appearance = NSAppearance(named: .darkAqua)
+        func add(_ title: String, _ symbol: String, _ sel: Selector, key: String = "", on: Bool = false, enabled: Bool = true, target: AnyObject? = nil) {
+            let it = NSMenuItem(title: title, action: sel, keyEquivalent: key)
+            it.target = target ?? self
+            it.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            it.state = on ? .on : .off
+            it.isEnabled = enabled
+            m.addItem(it)
+        }
+        add(speech.isSpeaking ? "Stop reading" : "Read aloud", "speaker.wave.2", #selector(speak), key: "r", enabled: done)
+        add("Show the whole conversation", "rectangle.stack", #selector(toggleThread), key: "t", on: showThread, enabled: done && thread.count > 1)
+        add("Keep open (pin)", "pin", #selector(togglePin), key: "p", on: pinned)
+        m.addItem(.separator())
+        add("New chat", "square.and.pencil", #selector(newChat), key: "n")
+        let export = NSMenuItem(title: "Export chat", action: nil, keyEquivalent: "")
+        export.image = NSImage(systemSymbolName: "square.and.arrow.up", accessibilityDescription: nil)
+        let em = NSMenu()
+        for (t, s, sel) in [("As a Markdown file…", "doc.text", #selector(AppDelegate.exportCurrentMarkdown)),
+                            ("To Apple Notes", "note.text", #selector(AppDelegate.exportCurrentNotes))] {
+            let it = NSMenuItem(title: t, action: sel, keyEquivalent: "")
+            it.target = appDelegate
+            it.image = NSImage(systemSymbolName: s, accessibilityDescription: nil)
+            em.addItem(it)
+        }
+        export.submenu = em
+        m.addItem(export)
+        add("History…", "clock.arrow.circlepath", #selector(AppDelegate.openHistory), target: appDelegate)
+        m.addItem(.separator())
+        let hint = NSMenuItem(title: "1–6 switch mode  ·  Tab ask  ·  Esc close", action: nil, keyEquivalent: "")
+        hint.isEnabled = false
+        m.addItem(hint)
+        m.popUp(positioning: nil, at: NSPoint(x: b.bounds.width - 240, y: b.bounds.height + 6), in: b)
+    }
+
+    // MARK: Showing a state
+
     func show(header: String, preview: String, state: State, footer: String) {
+        if case .streaming = state {
+            pendingStream = (header, preview, state, footer)
+            if streamTimer == nil {
+                let wait = max(0, 0.033 - Date().timeIntervalSince(lastStreamRender))
+                let t = Timer(timeInterval: wait, repeats: false) { [weak self] _ in
+                    guard let self else { return }
+                    self.streamTimer = nil
+                    guard let p = self.pendingStream else { return }
+                    self.pendingStream = nil
+                    self.lastStreamRender = Date()
+                    self.render(header: p.0, preview: p.1, state: p.2, footer: p.3)
+                }
+                RunLoop.main.add(t, forMode: .common)
+                streamTimer = t
+            }
+            return
+        }
+        streamTimer?.invalidate()
+        streamTimer = nil
+        pendingStream = nil
+        render(header: header, preview: preview, state: state, footer: footer)
+    }
+
+    private func render(header: String, preview: String, state: State, footer: String) {
         lastArgs = (header, preview, footer)
+        footerText = footer
         chip.stringValue = "  \(header)  "
         let pv = preview.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
         quoteLabel.stringValue = pv.isEmpty ? "—" : pv
-        footerLabel.stringValue = footer
-        newBtn.contentTintColor = NSColor.white.withAlphaComponent(0.6)
         var streaming = false
+        // Take the keyboard when the pop-up appears or a new answer starts, never while
+        // an answer is being written: you can go back to typing in your own app.
+        var wantKey = !panel.isVisible
+        isError = false
 
         switch state {
         case .loading:
             closeWork?.cancel()
             stopSpeaking()
             hideAsk()
-            setAnswerButtons(visible: false)
             resultText = ""
             streamingNow = false
+            loadingSince = Date()
+            wantKey = true
             startAnimating()
         case .streaming(let t):
             streaming = true
-            if !streamingNow { streamingNow = true; if animTimer == nil { startAnimating() } }
-            setAnswerButtons(visible: false)
+            streamingNow = true
+            if animTimer == nil { startAnimating() }
             resultText = t
-            let s = NSMutableAttributedString(attributedString: renderMarkdown(t))
-            s.append(NSAttributedString(string: " ▍", attributes: [.font: NSFont.systemFont(ofSize: 14), .foregroundColor: claudeOrange]))
+            let s = NSMutableAttributedString(attributedString: Markdown.render(t))
+            s.append(NSAttributedString(string: " ▍", attributes: [.font: NSFont.systemFont(ofSize: 14), .foregroundColor: Theme.accent]))
             textView.textStorage?.setAttributedString(s)
         case .result(let t):
             streamingNow = false
             stopAnimating()
             scheduleAutoClose(isDemo ? 0 : Settings.autoClose)
             resultText = t
-            setAnswerButtons(visible: true)
-            textView.textStorage?.setAttributedString(showThread && thread.count > 1 ? renderThread() : renderMarkdown(t))
+            textView.textStorage?.setAttributedString(showThread && thread.count > 1 ? renderThread() : Markdown.render(t))
         case .error(let t):
             streamingNow = false
             stopAnimating()
-            setAnswerButtons(visible: false)
             resultText = ""
-            textView.textStorage?.setAttributedString(NSAttributedString(string: t,
-                attributes: [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.systemRed.blended(withFraction: 0.3, of: .white)!]))
+            isError = true
+            errorMessage = t
+            textView.textStorage?.setAttributedString(errorText(t))
         }
+        updateBar()
 
         let textWidth = width - 28
         textView.frame.size.width = textWidth
@@ -2005,14 +2534,22 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         let used = textView.layoutManager?.usedRect(for: textView.textContainer!).height ?? 40
         quoteLabel.preferredMaxLayoutWidth = width - 32 - 30
         let quoteH = quoteLabel.fittingSize.height + 14
-        let chrome: CGFloat = 14 + 24 + 14 + quoteH + 10 + 22 + 12 + 10 + 1 + 9 + 13 + 11
-        let height = min(max(used + chrome + 4, 170), 620)
+        let chrome: CGFloat = 14 + 24 + 12 + quoteH + 10 + 24 + 12 + 10 + 1 + 44
+        let screenH = (panel.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
+        let height = min(max(used + chrome + 6, 176), min(660, screenH - 60))
 
         if !panel.isVisible || (isDemo && !streaming) {
             positionNearMouse(height: height)
+            let target = panel.frame
+            panel.setFrame(target.offsetBy(dx: 0, dy: -8), display: false)
             panel.alphaValue = 0
             panel.orderFrontRegardless()
-            NSAnimationContext.runAnimationGroup { $0.duration = 0.18; panel.animator().alphaValue = 1 }
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.2
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                panel.animator().alphaValue = 1
+                panel.animator().setFrame(target, display: true)
+            }
         } else if abs(panel.frame.height - height) > 0.5 {
             var f = panel.frame
             f.origin.y += f.height - height
@@ -2022,29 +2559,104 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         } else {
             panel.orderFrontRegardless()
         }
-        panel.makeKey()
-        if streaming || (showThread && thread.count > 1) { textView.scrollToEndOfDocument(nil) } else { scroll.contentView.scroll(to: .zero) }
+        if wantKey { panel.makeKey() }
+        if streaming || (showThread && thread.count > 1 && done) { textView.scrollToEndOfDocument(nil) } else { scroll.contentView.scroll(to: .zero) }
     }
+
+    /// Bottom bar: the status on the left, the actions that make sense right now on the right.
+    func updateBar() {
+        askBtn.isHidden = !done
+        copyBtn.isHidden = !done
+        replaceBtn.isHidden = !(done && allowReplace && replaceableModes.contains(mode))
+        retryBtn.isHidden = !(isError && appDelegate?.lastRequest != nil)
+        let needsSignIn = errorMessage.contains("not signed in"), needsSetup = errorMessage.contains("wasn't found")
+        fixBtn.isHidden = !(isError && (needsSignIn || needsSetup))
+        if !fixBtn.isHidden { setTitle(fixBtn, needsSignIn ? "Sign in…" : "Set up…", "", primary: true) }
+
+        let canThread = done && thread.count > 1
+        var t = footerText
+        if canThread { t = showThread ? "‹  " + t : t + "  ›" }
+        statusBtn.attributedTitle = NSAttributedString(string: "  " + t + "  ", attributes: [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: canThread ? Theme.ink2 : Theme.ink3])
+        statusBtn.hoverBg = canThread ? Theme.fill : .clear
+        statusBtn.toolTip = canThread ? (showThread ? "Show only the last answer (⌘T)" : "Show the whole conversation (⌘T)") : nil
+    }
+
+    func errorText(_ t: String) -> NSAttributedString {
+        let title = t.contains("not signed in") ? "Sign in to continue"
+            : t.contains("wasn't found") ? "Claude Code isn't installed"
+            : t.contains("clipboard") ? "Nothing to interpret" : "Couldn't get an answer"
+        let p = NSMutableParagraphStyle()
+        p.paragraphSpacing = 4
+        p.lineSpacing = 2
+        let s = NSMutableAttributedString(string: "⚠︎  " + title + "\n", attributes: [
+            .font: NSFont.systemFont(ofSize: 14, weight: .semibold), .foregroundColor: Theme.accentSoft, .paragraphStyle: p])
+        s.append(NSAttributedString(string: t, attributes: [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: Theme.ink2, .paragraphStyle: p]))
+        return s
+    }
+
+    /// The chat as a thread: earlier captures and answers dimmed, the latest one at the bottom.
+    func renderThread() -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        var n = 0
+        for (i, e) in thread.enumerated() {
+            let latest = i == thread.count - 1
+            var label: String
+            if let q = e.followUp { label = "↳ " + q } else {
+                n += 1
+                label = "Capture \(n) · \(e.mode) — " + e.capture.replacingOccurrences(of: "\n", with: " ")
+            }
+            if label.count > 92 { label = String(label.prefix(91)) + "…" }
+            let p = NSMutableParagraphStyle()
+            p.paragraphSpacing = 5
+            p.paragraphSpacingBefore = i == 0 ? 0 : 16
+            out.append(NSAttributedString(string: label + "\n", attributes: [
+                .font: NSFont.systemFont(ofSize: 11.5, weight: .semibold),
+                .foregroundColor: Theme.accentSoft.withAlphaComponent(latest ? 1 : 0.6), .paragraphStyle: p]))
+            let body = NSMutableAttributedString(attributedString: Markdown.render(e.answer))
+            if !latest {
+                body.enumerateAttribute(.foregroundColor, in: NSRange(location: 0, length: body.length)) { v, r, _ in
+                    if let c = v as? NSColor { body.addAttribute(.foregroundColor, value: c.withAlphaComponent(c.alphaComponent * 0.55), range: r) }
+                }
+                body.append(NSAttributedString(string: "\n"))
+            }
+            out.append(body)
+        }
+        return out
+    }
+
+    // MARK: Thinking animation
 
     func startAnimating() {
         animTimer?.invalidate()
-        frameIdx = 0; dots = 0
-        animTimer = Timer.scheduledTimer(withTimeInterval: 0.16, repeats: true) { [weak self] _ in
+        frameIdx = 0
+        let t = Timer(timeInterval: 0.16, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.frameIdx = (self.frameIdx + 1) % self.frames.count
             self.clawdView.image = self.frames[self.frameIdx]
-            if self.frameIdx % 2 == 0 && !self.streamingNow { self.dots = (self.dots + 1) % 4; self.setThinking() }
+            if !self.streamingNow { self.setThinking() }
         }
+        RunLoop.main.add(t, forMode: .common)
+        animTimer = t
         if !streamingNow { setThinking() }
     }
     func setThinking() {
-        textView.textStorage?.setAttributedString(NSAttributedString(string: "Thinking" + String(repeating: ".", count: dots),
-            attributes: [.font: NSFont.systemFont(ofSize: 14, weight: .medium), .foregroundColor: claudeOrange]))
+        let secs = Int(Date().timeIntervalSince(loadingSince))
+        let s = NSMutableAttributedString(string: "Thinking" + String(repeating: ".", count: (frameIdx / 2) % 4), attributes: [
+            .font: NSFont.systemFont(ofSize: 14, weight: .medium), .foregroundColor: Theme.accentSoft])
+        if secs >= 5 {   // slower models: show that it's still working
+            s.append(NSAttributedString(string: "    \(secs) s", attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular), .foregroundColor: Theme.ink3]))
+        }
+        textView.textStorage?.setAttributedString(s)
     }
     func stopAnimating() {
-        animTimer?.invalidate(); animTimer = nil
+        animTimer?.invalidate()
+        animTimer = nil
         clawdView.image = idleImage
     }
+
+    // MARK: Position, opening and closing
 
     func positionNearMouse(height: CGFloat) {
         if isDemo, let vf = NSScreen.main?.visibleFrame {   // demo: centered, for screenshots
@@ -2080,13 +2692,7 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         w.isReleasedWhenClosed = false
         let v = NSView()
         v.wantsLayer = true
-        let g = CAGradientLayer()
-        g.colors = [NSColor(srgbRed: 0.42, green: 0.20, blue: 0.13, alpha: 1).cgColor,
-                    NSColor(srgbRed: 0.10, green: 0.08, blue: 0.09, alpha: 1).cgColor,
-                    NSColor(srgbRed: 0.16, green: 0.12, blue: 0.20, alpha: 1).cgColor]
-        g.startPoint = CGPoint(x: 0, y: 1); g.endPoint = CGPoint(x: 1, y: 0)
-        g.frame = CGRect(origin: .zero, size: r.size)
-        v.layer = g
+        v.layer = Theme.gradient(r.size)
         w.contentView = v
         w.orderFrontRegardless()
         backdrop = w
@@ -2108,51 +2714,18 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(seconds), execute: w)
     }
 
-    @objc func toggleThread() {
-        showThread.toggle()
-        threadBtn.image = NSImage(systemSymbolName: showThread ? "rectangle.stack.fill" : "rectangle.stack", accessibilityDescription: nil)
-        threadBtn.contentTintColor = showThread ? claudeOrange : NSColor.white.withAlphaComponent(0.6)
-        threadBtn.toolTip = showThread ? "Show only the last answer" : "Show the whole conversation"
-        if let a = lastArgs, !resultText.isEmpty { show(header: a.header, preview: a.preview, state: .result(resultText), footer: a.footer) }
-    }
-
-    /// The chat as a thread: earlier captures and answers dimmed, the latest one at the bottom.
-    func renderThread() -> NSAttributedString {
-        let out = NSMutableAttributedString()
-        let para = NSMutableParagraphStyle(); para.paragraphSpacing = 4
-        var n = 0
-        for (i, e) in thread.enumerated() {
-            let latest = i == thread.count - 1
-            var label: String
-            if let q = e.followUp { label = "↳ " + q } else {
-                n += 1
-                label = "Capture \(n) · \(e.mode) — " + e.capture.replacingOccurrences(of: "\n", with: " ")
-            }
-            if label.count > 95 { label = String(label.prefix(94)) + "…" }
-            out.append(NSAttributedString(string: label + "\n", attributes: [
-                .font: NSFont.systemFont(ofSize: 11.5, weight: .semibold),
-                .foregroundColor: claudeOrange.withAlphaComponent(latest ? 1 : 0.65), .paragraphStyle: para]))
-            let body = NSMutableAttributedString(attributedString: renderMarkdown(e.answer))
-            if !latest {
-                body.enumerateAttribute(.foregroundColor, in: NSRange(location: 0, length: body.length)) { v, r, _ in
-                    if let c = v as? NSColor { body.addAttribute(.foregroundColor, value: c.withAlphaComponent(c.alphaComponent * 0.55), range: r) }
-                }
-            }
-            out.append(body)
-            if !latest {
-                out.append(NSAttributedString(string: "\n\n", attributes: [.font: NSFont.systemFont(ofSize: 6)]))
-            }
-        }
-        return out
-    }
-
     @objc func togglePin() {
         pinned.toggle()
         pinBtn.image = NSImage(systemSymbolName: pinned ? "pin.fill" : "pin", accessibilityDescription: "Pin")
-        pinBtn.contentTintColor = pinned ? claudeOrange : NSColor.white.withAlphaComponent(0.6)
-        pinBtn.toolTip = pinned ? "Unpin" : "Pin: keep this pop-up open"
-        hintLabel.stringValue = pinned ? "📌 pinned · ✕ to close" : "1–6 modes · tab ask · esc close"
-        if pinned { closeWork?.cancel() } else if !resultText.isEmpty { scheduleAutoClose(Settings.autoClose) }
+        pinBtn.contentTintColor = pinned ? Theme.accent : Theme.ink2
+        pinBtn.toolTip = pinned ? "Pinned: only ✕ closes it. Click to unpin (⌘P)" : "Keep this pop-up open (⌘P)"
+        if pinned { closeWork?.cancel() } else if done { scheduleAutoClose(Settings.autoClose) }
+    }
+
+    @objc func toggleThread() {
+        guard done, thread.count > 1 else { return }
+        showThread.toggle()
+        if let a = lastArgs { render(header: a.header, preview: a.preview, state: .result(resultText), footer: a.footer) }
     }
 
     @objc func close() {
@@ -2163,36 +2736,58 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
                                              completionHandler: { self.panel.orderOut(nil); self.panel.alphaValue = 1 })
     }
 
+    // MARK: Actions
+
+    func flash(_ b: HoverButton, _ title: String, _ key: String, primary: Bool = false) {
+        setTitle(b, "✓ Copied", "", primary: primary)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in self?.setTitle(b, title, key, primary: primary) }
+    }
+
     @objc func copyResult() {
+        guard done else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(resultText, forType: .string)
         appDelegate?.lastChange = NSPasteboard.general.changeCount  // don't treat this as a capture
-        flash(copyBtn, "checkmark")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { self.copyBtn.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil) }
+        flash(copyBtn, "Copy", "⌘C")
     }
 
     /// Fix / Translate: put the corrected or translated text back where it came from.
     @objc func replaceResult() {
-        let t = mainPart(resultText)
+        guard done else { return }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(t, forType: .string)
+        NSPasteboard.general.setString(mainPart(resultText), forType: .string)
         appDelegate?.lastChange = NSPasteboard.general.changeCount
         if AXIsProcessTrusted() {
             close()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { pasteKeystroke() }
         } else {
-            footerLabel.stringValue = "✓ Copied · press ⌘V to paste (Settings → Allow auto-paste)"
-            flash(replaceBtn, "checkmark")
+            flash(replaceBtn, "Replace", "⌘↩", primary: true)
+            footerText = "Copied · press ⌘V to paste (Settings → Allow auto-paste)"
+            updateBar()
         }
+    }
+
+    @objc func retry() { appDelegate?.retryLast() }
+
+    @objc func fixProblem() {
+        if errorMessage.contains("not signed in") { appDelegate?.login() } else { appDelegate?.openWelcome() }
+    }
+
+    @objc func newChat() {
+        appDelegate?.store.newChat()
+        thread = []
+        footerText = "✓ New chat · your next capture starts fresh"
+        updateBar()
     }
 
     // Read aloud
 
     @objc func speak() {
         if speech.isSpeaking { stopSpeaking(); return }
+        guard done else { return }
         let plain = resultText
-            .replacingOccurrences(of: #"(?m)^\s*-{3,}\s*$"#, with: "", options: .regularExpression)
-            .replacingOccurrences(of: #"[*`#>_]"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"(?m)^\s*(-{3,}|```.*)\s*$"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"[*`#>_|]"#, with: "", options: .regularExpression)
         guard !plain.isEmpty else { return }
         let u = AVSpeechUtterance(string: plain)
         let r = NLLanguageRecognizer()
@@ -2202,23 +2797,23 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
             u.voice = voices.first { $0.language == AVSpeechSynthesisVoice.currentLanguageCode() } ?? voices.first
         }
         speech.speak(u)
-        speakBtn.image = NSImage(systemSymbolName: "stop.fill", accessibilityDescription: "Stop")
+        stopBtn.isHidden = false
     }
     func stopSpeaking() {
         if speech.isSpeaking { speech.stopSpeaking(at: .immediate) }
-        speakBtn?.image = NSImage(systemSymbolName: "speaker.wave.2", accessibilityDescription: "Read aloud")
+        stopBtn?.isHidden = true
     }
     func speechSynthesizer(_ s: AVSpeechSynthesizer, didFinish u: AVSpeechUtterance) {
-        DispatchQueue.main.async { self.speakBtn.image = NSImage(systemSymbolName: "speaker.wave.2", accessibilityDescription: "Read aloud") }
+        DispatchQueue.main.async { self.stopBtn.isHidden = true }
     }
 
     // Follow-up questions
 
     @objc func showAsk() {
-        guard !resultText.isEmpty, !streamingNow else { return }
+        guard done else { return }
         closeWork?.cancel()
-        footerLabel.isHidden = true
-        hintLabel.isHidden = true
+        statusBtn.isHidden = true
+        actions.isHidden = true
         askField.isHidden = false
         askField.stringValue = ""
         panel.makeKey()
@@ -2227,8 +2822,8 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
     func hideAsk() {
         guard !askField.isHidden else { return }
         askField.isHidden = true
-        footerLabel.isHidden = false
-        hintLabel.isHidden = false
+        statusBtn.isHidden = false
+        actions.isHidden = false
         panel.makeFirstResponder(nil)
     }
     @objc func askSubmitted() {
@@ -2237,71 +2832,6 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         guard !q.isEmpty else { return }
         hideAsk()
         appDelegate?.followUp(q)
-    }
-
-    @objc func newChat() {
-        appDelegate?.store.newChat()
-        footerLabel.stringValue = "✓ New chat · your next capture starts fresh"
-        newBtn.contentTintColor = claudeOrange
-    }
-
-    func flash(_ b: NSButton, _ symbol: String) {
-        b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-    }
-
-    func renderMarkdown(_ raw: String) -> NSAttributedString {
-        // No blank lines around a "---" divider: the line itself is the spacing.
-        let md = raw.replacingOccurrences(of: #"\n[ \t]*\n([ \t]*-{3,}[ \t]*)\n[ \t]*\n"#, with: "\n$1\n", options: .regularExpression)
-        let base = NSFont.systemFont(ofSize: 14)
-        let text = NSColor.white.withAlphaComponent(0.92)
-        let para = NSMutableParagraphStyle(); para.paragraphSpacing = 5; para.lineSpacing = 2.5
-        let out = NSMutableAttributedString()
-        let lines = md.components(separatedBy: "\n")
-        for (i, rawLine) in lines.enumerated() {
-            var line = rawLine
-            var lineFont = base
-            if line.trimmingCharacters(in: .whitespaces).range(of: #"^-{3,}$"#, options: .regularExpression) != nil {
-                out.append(NSAttributedString(string: String(repeating: "─", count: 22),
-                    attributes: [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.white.withAlphaComponent(0.2), .paragraphStyle: para]))
-                if i < lines.count - 1 { out.append(NSAttributedString(string: "\n", attributes: [.font: base, .paragraphStyle: para])) }
-                continue
-            }
-            if let r = line.range(of: #"^#{1,6}\s+"#, options: .regularExpression) {
-                line.removeSubrange(r); lineFont = .systemFont(ofSize: 15, weight: .bold)
-            } else if let r = line.range(of: #"^(\s*)[-*]\s+"#, options: .regularExpression) {
-                let indent = String(line[r].prefix { $0 == " " })
-                out.append(NSAttributedString(string: indent + "▪︎ ", attributes: [.font: base, .foregroundColor: claudeOrange, .paragraphStyle: para]))
-                line.removeSubrange(r)
-            }
-            let parsed = (try? AttributedString(markdown: line, options:
-                .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(line)
-            for run in parsed.runs {
-                let s = String(parsed[run.range].characters)
-                var font = lineFont
-                var color = text
-                var attrs: [NSAttributedString.Key: Any] = [:]
-                if let intent = run.inlinePresentationIntent {
-                    if intent.contains(.code) {
-                        font = .monospacedSystemFont(ofSize: 12.5, weight: .regular)
-                        color = claudeOrange.blended(withFraction: 0.35, of: .white)!
-                        attrs[.backgroundColor] = NSColor.white.withAlphaComponent(0.08)
-                    } else {
-                        var traits: NSFontDescriptor.SymbolicTraits = []
-                        if intent.contains(.stronglyEmphasized) { traits.insert(.bold); color = .white }
-                        if intent.contains(.emphasized) { traits.insert(.italic) }
-                        if !traits.isEmpty {
-                            font = NSFont(descriptor: lineFont.fontDescriptor.withSymbolicTraits(traits), size: lineFont.pointSize) ?? lineFont
-                        }
-                    }
-                }
-                attrs[.font] = font; attrs[.foregroundColor] = color; attrs[.paragraphStyle] = para
-                out.append(NSAttributedString(string: s, attributes: attrs))
-            }
-            if i < lines.count - 1 {
-                out.append(NSAttributedString(string: "\n", attributes: [.font: base, .paragraphStyle: para]))
-            }
-        }
-        return out
     }
 }
 
@@ -2446,20 +2976,28 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
     let startBtn = NSButton(title: "Turn on ClaudeSniper", target: nil, action: nil)
 
     override init() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 500),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 560),
                           styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
         super.init()
         window.title = "Welcome to ClaudeSniper"
+        window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isReleasedWhenClosed = false
         window.delegate = self
         let content = NSView()
         window.contentView = content
 
-        let clawd = NSImageView(image: Pixel.clawd(px: 4))
+        // The same warm gradient as the pop-up's backdrop and the app icon.
+        let band = NSView()
+        band.wantsLayer = true
+        band.layer = Theme.gradient(NSSize(width: 540, height: 176))
+        band.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(band)
+        let clawd = NSImageView(image: Pixel.clawd(px: 5))
         clawd.imageScaling = .scaleNone
         let title = NSTextField(labelWithString: "Welcome to ClaudeSniper")
         title.font = .systemFont(ofSize: 22, weight: .bold)
+        title.textColor = .white
         let sub = NSTextField(wrappingLabelWithString: "Capture anything on your screen with TextSniper (⌘⇧2) and Claude explains it in a pop-up, using your Claude plan. A few quick checks:")
         sub.font = .systemFont(ofSize: 13)
         sub.textColor = .secondaryLabelColor
@@ -2468,22 +3006,22 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 14
+        stack.spacing = 8
         let specs: [(String, String, String, Selector)] = [
-            ("Claude Code", "The free command-line app ClaudeSniper uses to talk to Claude.", "Install…", #selector(installClaude)),
-            ("Signed in to your Claude plan", "Pro or Max. Usage comes from your plan; no API key.", "Sign in…", #selector(signIn)),
-            ("TextSniper", "The OCR app that copies text from your screen with ⌘⇧2.", "Get TextSniper", #selector(getTextSniper)),
-            ("Try it", "See a real answer in the pop-up with a sample sentence.", "Try a sample", #selector(trySample)),
+            ("Claude Code", "The free command-line tool that talks to Claude.", "Install…", #selector(installClaude)),
+            ("Signed in to your Claude plan", "Pro or Max. It uses your plan, with no API key.", "Sign in…", #selector(signIn)),
+            ("TextSniper", "Copies text from anywhere on your screen with ⌘⇧2.", "Get TextSniper", #selector(getTextSniper)),
+            ("Try it", "See a real answer for a sample sentence.", "Try a sample", #selector(trySample)),
         ]
         for (name, detail, button, action) in specs {
             let icon = NSImageView()
             icon.symbolConfiguration = .init(pointSize: 20, weight: .medium)
             let n = NSTextField(labelWithString: name)
             n.font = .systemFont(ofSize: 13.5, weight: .semibold)
-            let d = NSTextField(wrappingLabelWithString: detail)
+            let d = NSTextField(labelWithString: detail)
             d.font = .systemFont(ofSize: 11.5)
             d.textColor = .secondaryLabelColor
-            d.preferredMaxLayoutWidth = 300
+            d.lineBreakMode = .byTruncatingTail
             let texts = NSStackView(views: [n, d])
             texts.orientation = .vertical
             texts.alignment = .leading
@@ -2496,8 +3034,22 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
             row.orientation = .horizontal
             row.alignment = .centerY
             row.spacing = 12
+            row.edgeInsets = NSEdgeInsets(top: 11, left: 14, bottom: 11, right: 12)
             row.translatesAutoresizingMaskIntoConstraints = false
-            row.widthAnchor.constraint(equalToConstant: 460).isActive = true
+            row.widthAnchor.constraint(equalToConstant: 476).isActive = true
+            row.heightAnchor.constraint(equalToConstant: 56).isActive = true
+            let card = NSBox()
+            card.boxType = .custom
+            card.titlePosition = .noTitle
+            card.cornerRadius = 10
+            card.borderWidth = 0
+            card.fillColor = NSColor.labelColor.withAlphaComponent(0.05)
+            card.translatesAutoresizingMaskIntoConstraints = false
+            row.addSubview(card, positioned: .below, relativeTo: nil)
+            NSLayoutConstraint.activate([
+                card.topAnchor.constraint(equalTo: row.topAnchor), card.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+                card.leadingAnchor.constraint(equalTo: row.leadingAnchor), card.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+            ])
             icon.widthAnchor.constraint(equalToConstant: 26).isActive = true
             stack.addArrangedSubview(row)
             rows.append(Row(icon: icon, detail: d, button: b))
@@ -2508,6 +3060,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         startBtn.target = self
         startBtn.action = #selector(finish)
         startBtn.bezelStyle = .rounded
+        startBtn.bezelColor = claudeOrange
         startBtn.keyEquivalent = "\r"
         let bottom = NSStackView(views: [again, startBtn])
         bottom.orientation = .horizontal
@@ -2518,19 +3071,23 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
             content.addSubview(v)
         }
         NSLayoutConstraint.activate([
-            clawd.topAnchor.constraint(equalTo: content.topAnchor, constant: 40),
+            band.topAnchor.constraint(equalTo: content.topAnchor),
+            band.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            band.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            band.heightAnchor.constraint(equalToConstant: 176),
+            clawd.topAnchor.constraint(equalTo: content.topAnchor, constant: 46),
             clawd.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-            clawd.widthAnchor.constraint(equalToConstant: 68),
-            clawd.heightAnchor.constraint(equalToConstant: 48),
+            clawd.widthAnchor.constraint(equalToConstant: 85),
+            clawd.heightAnchor.constraint(equalToConstant: 60),
             title.topAnchor.constraint(equalTo: clawd.bottomAnchor, constant: 14),
             title.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-            sub.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
+            sub.topAnchor.constraint(equalTo: band.bottomAnchor, constant: 18),
             sub.centerXAnchor.constraint(equalTo: content.centerXAnchor),
             sub.widthAnchor.constraint(equalToConstant: 440),
-            stack.topAnchor.constraint(equalTo: sub.bottomAnchor, constant: 24),
+            stack.topAnchor.constraint(equalTo: sub.bottomAnchor, constant: 18),
             stack.centerXAnchor.constraint(equalTo: content.centerXAnchor),
             bottom.topAnchor.constraint(greaterThanOrEqualTo: stack.bottomAnchor, constant: 24),
-            bottom.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -40),
+            bottom.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -32),
             bottom.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -24),
         ])
     }
@@ -2600,77 +3157,190 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
 
 // MARK: - History window
 
+final class HistoryCell: NSTableCellView {
+    let icon = NSImageView()
+    let title = NSTextField(labelWithString: "")
+    let sub = NSTextField(labelWithString: "")
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        icon.symbolConfiguration = .init(pointSize: 13, weight: .medium)
+        icon.contentTintColor = claudeOrange
+        title.font = .systemFont(ofSize: 12.5, weight: .medium)
+        title.lineBreakMode = .byTruncatingTail
+        sub.font = .systemFont(ofSize: 10.5)
+        sub.textColor = .secondaryLabelColor
+        sub.lineBreakMode = .byTruncatingTail
+        for v in [icon, title, sub] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false; addSubview(v) }
+        NSLayoutConstraint.activate([
+            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 22),
+            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
+            title.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+            title.topAnchor.constraint(equalTo: topAnchor, constant: 7),
+            sub.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            sub.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            sub.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 2),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError("not used") }
+}
+
+/// Every saved answer: a searchable list grouped by day on the left, the answer on the right.
 final class HistoryWindowController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
+    enum Row { case day(String), entry(HistoryEntry) }
+
     let window: NSWindow
     let table = NSTableView()
     let search = NSSearchField()
     let detail = NSTextView()
-    var rows: [HistoryEntry] = []
+    let detailScroll = NSScrollView()
+    let modeTag = NSTextField(labelWithString: "")
+    let meta = NSTextField(labelWithString: "")
+    let emptyBox = NSStackView()
+    let emptyLabel = NSTextField(wrappingLabelWithString: "")
+    var entryButtons: [NSControl] = []
+    var clearBtn: NSButton!
+    var rows: [Row] = []
     let store: HistoryStore
 
     init(store: HistoryStore) {
         self.store = store
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 860, height: 540),
-                          styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 600),
+                          styleMask: [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView],
+                          backing: .buffered, defer: false)
         super.init()
         window.title = "ClaudeSniper History"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 640, height: 380)
+        window.minSize = NSSize(width: 720, height: 420)
         let content = NSView()
         window.contentView = content
 
+        // Sidebar
+        let side = NSVisualEffectView()
+        side.material = .sidebar
+        side.blendingMode = .behindWindow
+        let heading = NSTextField(labelWithString: "History")
+        heading.font = .systemFont(ofSize: 13, weight: .semibold)
+        heading.textColor = .secondaryLabelColor
         search.placeholderString = "Search captures and answers"
         search.delegate = self
+        search.controlSize = .large
         let col = NSTableColumn(identifier: .init("entry"))
-        col.width = 310
         table.addTableColumn(col)
         table.headerView = nil
-        table.rowHeight = 44
+        table.style = .sourceList
+        table.backgroundColor = .clear
+        table.floatsGroupRows = false
         table.dataSource = self
         table.delegate = self
         let tScroll = NSScrollView()
         tScroll.documentView = table
         tScroll.hasVerticalScroller = true
-        tScroll.borderType = .bezelBorder
+        tScroll.drawsBackground = false
+        let line = NSBox()
+        line.boxType = .separator
 
+        // Detail
+        modeTag.font = .systemFont(ofSize: 11, weight: .semibold)
+        modeTag.textColor = MDTheme.window.codeText
+        modeTag.wantsLayer = true
+        modeTag.layer?.backgroundColor = claudeOrange.withAlphaComponent(0.16).cgColor
+        modeTag.layer?.cornerRadius = 9
+        meta.font = .systemFont(ofSize: 11.5)
+        meta.textColor = .secondaryLabelColor
         detail.isEditable = false
-        detail.textContainerInset = NSSize(width: 12, height: 12)
+        detail.drawsBackground = false
+        detail.textContainerInset = NSSize(width: 24, height: 8)
         detail.isVerticallyResizable = true
         detail.autoresizingMask = [.width]
         detail.textContainer?.widthTracksTextView = true
-        let dScroll = NSScrollView()
-        dScroll.documentView = detail
-        dScroll.hasVerticalScroller = true
-        dScroll.borderType = .bezelBorder
+        detail.linkTextAttributes = [.foregroundColor: claudeOrange, .underlineStyle: NSUnderlineStyle.single.rawValue]
+        detailScroll.documentView = detail
+        detailScroll.hasVerticalScroller = true
+        detailScroll.drawsBackground = false
+
+        let clawd = NSImageView(image: Pixel.clawd(px: 4, on: false))
+        clawd.imageScaling = .scaleNone
+        emptyLabel.alignment = .center
+        emptyLabel.textColor = .secondaryLabelColor
+        emptyLabel.font = .systemFont(ofSize: 13)
+        emptyBox.orientation = .vertical
+        emptyBox.spacing = 14
+        emptyBox.addArrangedSubview(clawd)
+        emptyBox.addArrangedSubview(emptyLabel)
 
         let copy = NSButton(title: "Copy answer", target: self, action: #selector(copyAnswer))
-        let md = NSButton(title: "Export chat as Markdown…", target: self, action: #selector(exportMD))
-        let notes = NSButton(title: "Export chat to Notes", target: self, action: #selector(exportToNotes))
-        let clear = NSButton(title: "Clear history…", target: self, action: #selector(clearAll))
+        let open = NSButton(title: "Open in pop-up", target: self, action: #selector(openInPopup))
+        open.toolTip = "Show this answer in the pop-up. Follow-up questions continue that chat."
+        let export = NSPopUpButton(frame: .zero, pullsDown: true)
+        export.addItems(withTitles: ["Export chat", "As a Markdown file…", "To Apple Notes"])
+        export.item(at: 1)?.target = self
+        export.item(at: 1)?.action = #selector(exportMD)
+        export.item(at: 2)?.target = self
+        export.item(at: 2)?.action = #selector(exportToNotes)
+        clearBtn = NSButton(title: "Clear history…", target: self, action: #selector(clearAll))
+        for b in [copy, open, export, clearBtn] as [NSButton] { b.bezelStyle = .rounded }
+        entryButtons = [copy, open, export]
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let buttons = NSStackView(views: [copy, md, notes, spacer, clear])
-        buttons.orientation = .horizontal
+        let bar = NSStackView(views: [copy, open, export, spacer, clearBtn])
+        bar.orientation = .horizontal
+        bar.spacing = 8
+        let barLine = NSBox()
+        barLine.boxType = .separator
 
-        for v in [search, tScroll, dScroll, buttons] as [NSView] {
+        for v in [side, line, modeTag, meta, detailScroll, emptyBox, barLine, bar] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(v)
         }
+        for v in [heading, search, tScroll] as [NSView] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            side.addSubview(v)
+        }
         NSLayoutConstraint.activate([
-            search.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
-            search.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
-            search.widthAnchor.constraint(equalToConstant: 310),
+            side.topAnchor.constraint(equalTo: content.topAnchor),
+            side.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            side.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            side.widthAnchor.constraint(equalToConstant: 320),
+            line.topAnchor.constraint(equalTo: content.topAnchor),
+            line.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            line.leadingAnchor.constraint(equalTo: side.trailingAnchor),
+            line.widthAnchor.constraint(equalToConstant: 1),
+
+            heading.topAnchor.constraint(equalTo: side.topAnchor, constant: 7),
+            heading.leadingAnchor.constraint(equalTo: side.leadingAnchor, constant: 78),
+            search.topAnchor.constraint(equalTo: side.topAnchor, constant: 38),
+            search.leadingAnchor.constraint(equalTo: side.leadingAnchor, constant: 12),
+            search.trailingAnchor.constraint(equalTo: side.trailingAnchor, constant: -12),
             tScroll.topAnchor.constraint(equalTo: search.bottomAnchor, constant: 8),
-            tScroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
-            tScroll.widthAnchor.constraint(equalToConstant: 310),
-            tScroll.bottomAnchor.constraint(equalTo: buttons.topAnchor, constant: -10),
-            dScroll.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
-            dScroll.leadingAnchor.constraint(equalTo: tScroll.trailingAnchor, constant: 10),
-            dScroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
-            dScroll.bottomAnchor.constraint(equalTo: buttons.topAnchor, constant: -10),
-            buttons.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
-            buttons.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
-            buttons.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
+            tScroll.leadingAnchor.constraint(equalTo: side.leadingAnchor),
+            tScroll.trailingAnchor.constraint(equalTo: side.trailingAnchor),
+            tScroll.bottomAnchor.constraint(equalTo: side.bottomAnchor),
+
+            modeTag.topAnchor.constraint(equalTo: content.topAnchor, constant: 22),
+            modeTag.leadingAnchor.constraint(equalTo: line.trailingAnchor, constant: 28),
+            modeTag.heightAnchor.constraint(equalToConstant: 18),
+            meta.leadingAnchor.constraint(equalTo: modeTag.trailingAnchor, constant: 10),
+            meta.centerYAnchor.constraint(equalTo: modeTag.centerYAnchor),
+            detailScroll.topAnchor.constraint(equalTo: modeTag.bottomAnchor, constant: 8),
+            detailScroll.leadingAnchor.constraint(equalTo: line.trailingAnchor),
+            detailScroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            detailScroll.bottomAnchor.constraint(equalTo: barLine.topAnchor),
+            emptyBox.centerXAnchor.constraint(equalTo: detailScroll.centerXAnchor),
+            emptyBox.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+            emptyLabel.widthAnchor.constraint(equalToConstant: 280),
+
+            barLine.leadingAnchor.constraint(equalTo: line.trailingAnchor),
+            barLine.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            barLine.heightAnchor.constraint(equalToConstant: 1),
+            barLine.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -52),
+            bar.leadingAnchor.constraint(equalTo: line.trailingAnchor, constant: 20),
+            bar.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            bar.centerYAnchor.constraint(equalTo: content.bottomAnchor, constant: -26),
         ])
     }
 
@@ -2681,58 +3351,121 @@ final class HistoryWindowController: NSObject, NSTableViewDataSource, NSTableVie
         window.makeKeyAndOrderFront(nil)
     }
 
+    /// Sample answers for `--demo-history`, so screenshots never show real captures.
+    static let sample: [HistoryEntry] = {
+        func e(_ hoursAgo: Double, _ mode: String, _ capture: String, _ answer: String, followUp: String? = nil, chat: String = "a") -> HistoryEntry {
+            var x = HistoryEntry(chatID: chat, mode: mode, model: "Haiku · low", capture: capture, followUp: followUp, answer: answer)
+            x.date = Date().addingTimeInterval(-hoursAgo * 3600)
+            return x
+        }
+        let photo = "What is photosynthesis and why does it matter?"
+        return [
+            e(50, "Translate", "La entropía mide el número de configuraciones microscópicas de un sistema.", "Entropy measures the number of microscopic configurations of a system.", chat: "c"),
+            e(27, "Fix", "i has went to the libary yesterday", "I went to the library yesterday.\n\n---\n\n- \"i\" → \"I\"\n- \"has went\" → \"went\"\n- \"libary\" → \"library\"", chat: "b"),
+            e(26, "Solve", "Solve 3x + 7 = 22", "1. Subtract 7 from both sides: `3x = 15`\n2. Divide by 3: `x = 5`\n\n**x = 5**", chat: "b"),
+            e(1.2, "Summarize", "The mitochondrion is an organelle that produces most of the chemical energy (ATP) needed to power the cell.", "- Mitochondria are organelles inside cells\n- They produce most of the cell's **ATP**\n- ATP is the energy the cell runs on"),
+            e(0.4, "Explain", photo, "**Photosynthesis** is the process plants, algae and some bacteria use to turn sunlight into chemical energy.\n\n- **In:** light + water (`H₂O`) + carbon dioxide (`CO₂`)\n- **Out:** glucose (food) + oxygen (`O₂`)\n\nIt matters because it produces *almost all the oxygen* we breathe and is the base of every food chain."),
+            e(0.3, "Explain", photo, "Not the light-dependent part: without light there is no energy to split water. The **Calvin cycle** can keep running for a short while on stored ATP and NADPH.", followUp: "Does it happen at night?"),
+        ]
+    }()
+    var entries: [HistoryEntry] { isDemo ? Self.sample : store.entries }
+
     func reload() {
         let q = search.stringValue.lowercased()
-        rows = store.entries.reversed().filter {
+        let list = entries.reversed().filter {
             q.isEmpty || $0.capture.lowercased().contains(q) || $0.answer.lowercased().contains(q)
                 || ($0.followUp?.lowercased().contains(q) ?? false)
         }
+        rows = []
+        var lastDay = ""
+        let df = DateFormatter()
+        df.dateStyle = .medium
+        let cal = Calendar.current
+        for e in list {
+            let day = cal.isDateInToday(e.date) ? "Today" : cal.isDateInYesterday(e.date) ? "Yesterday" : df.string(from: e.date)
+            if day != lastDay { rows.append(.day(day)); lastDay = day }
+            rows.append(.entry(e))
+        }
         table.reloadData()
-        if rows.isEmpty {
-            detail.string = store.entries.isEmpty ? "No answers yet. Capture something with TextSniper." : "No matches."
-        } else {
-            table.selectRowIndexes([0], byExtendingSelection: false)
-            tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification))
+        let has = !list.isEmpty
+        emptyBox.isHidden = has
+        for v in [detailScroll, modeTag, meta] as [NSView] { v.isHidden = !has }
+        entryButtons.forEach { $0.isEnabled = has }
+        clearBtn.isEnabled = !entries.isEmpty
+        emptyLabel.stringValue = entries.isEmpty ? "No answers yet.\nCapture something with TextSniper and it will show up here." : "No matches."
+        if has, let first = rows.firstIndex(where: { if case .entry = $0 { return true }; return false }) {
+            table.selectRowIndexes([first], byExtendingSelection: false)
+            showSelected()
         }
     }
 
     func controlTextDidChange(_ obj: Notification) { reload() }
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
+    func tableView(_ tableView: NSTableView, isGroupRow row: Int) -> Bool { if case .day = rows[row] { return true }; return false }
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { if case .day = rows[row] { return 26 }; return 46 }
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { if case .entry = rows[row] { return true }; return false }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let e = rows[row]
-        let id = NSUserInterfaceItemIdentifier("cell")
-        let tf = (tableView.makeView(withIdentifier: id, owner: nil) as? NSTextField) ?? {
-            let t = NSTextField(labelWithString: "")
-            t.identifier = id
-            t.maximumNumberOfLines = 2
-            return t
-        }()
-        let df = DateFormatter(); df.dateStyle = .short; df.timeStyle = .short
-        var title = (e.followUp.map { "↳ " + $0 } ?? e.capture).replacingOccurrences(of: "\n", with: " ")
-        if title.count > 48 { title = String(title.prefix(47)) + "…" }
-        let s = NSMutableAttributedString(string: title + "\n", attributes: [.font: NSFont.systemFont(ofSize: 12.5)])
-        s.append(NSAttributedString(string: "\(df.string(from: e.date)) · \(e.mode)",
-                                    attributes: [.font: NSFont.systemFont(ofSize: 10.5), .foregroundColor: NSColor.secondaryLabelColor]))
-        tf.attributedStringValue = s
-        return tf
+        switch rows[row] {
+        case .day(let name):
+            let id = NSUserInterfaceItemIdentifier("day")
+            let tf = (tableView.makeView(withIdentifier: id, owner: nil) as? NSTextField) ?? {
+                let t = NSTextField(labelWithString: "")
+                t.identifier = id
+                t.font = .systemFont(ofSize: 11, weight: .semibold)
+                t.textColor = .tertiaryLabelColor
+                return t
+            }()
+            tf.stringValue = name
+            return tf
+        case .entry(let e):
+            let id = NSUserInterfaceItemIdentifier("entry")
+            let cell = (tableView.makeView(withIdentifier: id, owner: nil) as? HistoryCell) ?? {
+                let c = HistoryCell(frame: .zero)
+                c.identifier = id
+                return c
+            }()
+            let symbol = e.followUp != nil ? "arrow.turn.down.right" : (builtInModes.first { $0.label == e.mode }?.symbol ?? "star")
+            cell.icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: e.mode)
+            cell.title.stringValue = (e.followUp ?? e.capture).replacingOccurrences(of: "\n", with: " ")
+            let tf = DateFormatter()
+            tf.timeStyle = .short
+            cell.sub.stringValue = "\(tf.string(from: e.date)) · \(e.mode) · \(e.model)"
+            return cell
+        }
     }
 
     var selected: HistoryEntry? {
         let r = table.selectedRow
-        return r >= 0 && r < rows.count ? rows[r] : nil
+        guard r >= 0, r < rows.count, case .entry(let e) = rows[r] else { return nil }
+        return e
     }
 
-    func tableViewSelectionDidChange(_ n: Notification) {
+    func tableViewSelectionDidChange(_ n: Notification) { showSelected() }
+
+    func showSelected() {
         guard let e = selected else { return }
-        let df = DateFormatter(); df.dateStyle = .medium; df.timeStyle = .short
-        let s = NSMutableAttributedString()
-        s.append(NSAttributedString(string: "\(df.string(from: e.date)) · \(e.mode) · \(e.model)\n\n",
-                                    attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]))
-        s.append(NSAttributedString(string: (e.followUp.map { "↳ " + $0 } ?? e.capture) + "\n\n",
-                                    attributes: [.font: NSFont.systemFont(ofSize: 12.5), .foregroundColor: NSColor.secondaryLabelColor]))
-        s.append(inlineMarkdown(e.answer, size: 13.5, color: .labelColor))
+        let df = DateFormatter()
+        df.dateStyle = .medium
+        df.timeStyle = .short
+        modeTag.stringValue = "  \(e.followUp != nil ? "Follow-up" : e.mode)  "
+        meta.stringValue = "\(df.string(from: e.date)) · \(e.model)"
+        // What was captured (or asked), as a quote; then the answer.
+        var q = e.followUp ?? e.capture
+        if q.count > 700 { q = String(q.prefix(700)) + "…" }
+        let quote = NSMutableParagraphStyle()
+        quote.headIndent = 14
+        quote.lineSpacing = 2
+        quote.paragraphSpacing = 2
+        let s = NSMutableAttributedString(string: "▎ ", attributes: [.font: NSFont.systemFont(ofSize: 12.5), .foregroundColor: claudeOrange])
+        s.append(NSAttributedString(string: q + "\n", attributes: [.font: NSFont.systemFont(ofSize: 12.5), .foregroundColor: NSColor.secondaryLabelColor]))
+        s.addAttribute(.paragraphStyle, value: quote, range: NSRange(location: 0, length: s.length))
+        s.append(NSAttributedString(string: "\n", attributes: [.font: NSFont.systemFont(ofSize: 6)]))
+        var th = MDTheme.window
+        th.width = max(detailScroll.frame.width - 60, 320)
+        s.append(Markdown.render(e.answer, th))
         detail.textStorage?.setAttributedString(s)
+        detail.scroll(.zero)
     }
 
     @objc func copyAnswer() {
@@ -2741,6 +3474,7 @@ final class HistoryWindowController: NSObject, NSTableViewDataSource, NSTableVie
         NSPasteboard.general.setString(e.answer, forType: .string)
         appDelegate?.lastChange = NSPasteboard.general.changeCount
     }
+    @objc func openInPopup() { if let e = selected { appDelegate?.openFromHistory(e) } }
     @objc func exportMD() { if let e = selected { appDelegate?.exportMarkdown(chatID: e.chatID) } }
     @objc func exportToNotes() { if let e = selected { appDelegate?.exportNotes(chatID: e.chatID) } }
     @objc func clearAll() {
