@@ -469,6 +469,54 @@ enum Markdown {
     }
 }
 
+// MARK: - Tables (rows of cells), for "Copy table"
+
+typealias Table = [[String]]
+
+/// The Markdown tables in a text, as rows of plain cells.
+func markdownTables(_ md: String) -> [Table] {
+    var out: [Table] = [], cur: Table = []
+    func flush() { if cur.count > 1 { out.append(cur) }; cur = [] }
+    for line in md.components(separatedBy: "\n") {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        guard t.hasPrefix("|"), t.hasSuffix("|"), t.count > 2 else { flush(); continue }
+        if t.range(of: #"^\|[\s:|-]+\|$"#, options: .regularExpression) != nil { continue }   // the |---|---| row
+        cur.append(t.dropFirst().dropLast().components(separatedBy: "|").map {
+            $0.replacingOccurrences(of: "**", with: "").replacingOccurrences(of: "`", with: "").trimmingCharacters(in: .whitespaces)
+        })
+    }
+    flush()
+    return out
+}
+
+func tableMarkdown(_ t: Table) -> String {
+    var md = ""
+    for (r, row) in t.enumerated() {
+        md += "| " + row.joined(separator: " | ") + " |\n"
+        if r == 0 { md += "|" + String(repeating: "---|", count: row.count) + "\n" }
+    }
+    return md
+}
+
+/// Puts tables on the clipboard so they paste as real tables: HTML for Notion, Word,
+/// Docs and Mail; tab-separated text for Excel, Numbers and Sheets.
+func copyTables(_ tables: [Table]) {
+    func clean(_ c: String) -> String { c.replacingOccurrences(of: "\t", with: " ").replacingOccurrences(of: "\n", with: " ") }
+    func esc(_ c: String) -> String {
+        c.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;").replacingOccurrences(of: ">", with: "&gt;")
+    }
+    let tsv = tables.map { $0.map { $0.map(clean).joined(separator: "\t") }.joined(separator: "\n") }.joined(separator: "\n\n")
+    let html = "<meta charset=\"utf-8\">" + tables.map { t in
+        "<table>" + t.enumerated().map { r, row in
+            "<tr>" + row.map { r == 0 ? "<th>\(esc($0))</th>" : "<td>\(esc($0))</td>" }.joined() + "</tr>"
+        }.joined() + "</table>"
+    }.joined(separator: "<br>")
+    let pb = NSPasteboard.general
+    pb.clearContents()
+    pb.setString(html, forType: .html)
+    pb.setString(tsv, forType: .string)
+}
+
 // MARK: - Chats (memory length is a setting)
 
 struct Chat: Codable { var id: String; var title: String; var created: Date; var lastUsed: Date; var count: Int }
@@ -851,8 +899,8 @@ func setHotkey(_ id: UInt32, code: Int?, mods: NSEvent.ModifierFlags = []) {
 
 /// Reads the text in an image, on this Mac. If it contains tables (macOS 26+), the text is
 /// read row by row and each table is added as Markdown so Claude sees its structure.
-func recognizeText(at path: String) -> (text: String, forClaude: String) {
-    guard let img = NSImage(contentsOfFile: path)?.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return ("", "") }
+func recognizeText(at path: String) -> (text: String, forClaude: String, tables: [Table]) {
+    guard let img = NSImage(contentsOfFile: path)?.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return ("", "", []) }
     let req = VNRecognizeTextRequest()
     req.recognitionLevel = .accurate
     req.usesLanguageCorrection = true
@@ -860,29 +908,27 @@ func recognizeText(at path: String) -> (text: String, forClaude: String) {
     try? VNImageRequestHandler(cgImage: img).perform([req])
     let classic = (req.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
 
+    // Table detection needs the macOS 26 SDK (Xcode 26, Swift 6.2) to build, and macOS 26 to run.
+    #if compiler(>=6.2)
     if #available(macOS 26.0, *) {
-        var transcript = "", tables: [String] = []
+        var transcript = "", tables: [Table] = []
         let sem = DispatchSemaphore(value: 0)
         Task.detached {
             if let doc = try? await RecognizeDocumentsRequest().perform(on: img, orientation: nil).first?.document {
                 transcript = doc.text.transcript
                 for t in doc.tables where t.rows.count > 1 {
-                    var md = ""
-                    for (r, row) in t.rows.enumerated() {
-                        md += "| " + row.map { $0.content.text.transcript.replacingOccurrences(of: "\n", with: " ") }.joined(separator: " | ") + " |\n"
-                        if r == 0 { md += "|" + String(repeating: "---|", count: row.count) + "\n" }
-                    }
-                    tables.append(md)
+                    tables.append(t.rows.map { $0.map { $0.content.text.transcript.replacingOccurrences(of: "\n", with: " ") } })
                 }
             }
             sem.signal()
         }
         _ = sem.wait(timeout: .now() + 8)
         if !tables.isEmpty, !transcript.isEmpty {
-            return (transcript, transcript + "\n\nThe capture contains a table. Its structure:\n\n" + tables.joined(separator: "\n"))
+            return (transcript, transcript + "\n\nThe capture contains a table. Its structure:\n\n" + tables.map(tableMarkdown).joined(separator: "\n"), tables)
         }
     }
-    return (classic, classic)
+    #endif
+    return (classic, classic, [])
 }
 
 // MARK: - TextSniper's ⌘⇧2 (optional, only with Input Monitoring; its overlay is detected anyway)
@@ -928,6 +974,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let header: String; let preview: String; let text: String; let mode: String; let footer: String
         let replace: Bool; let chatID: String
         var entryID: String? = nil   // from History: show the chat up to this answer
+        var tables: [Table] = []     // tables detected in the capture
     }
     struct Request { let prompt: String; let image: Bool; let preview: String; let followUp: String? }
     /// The last question sent to Claude, for "Try again".
@@ -997,7 +1044,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var defaultMode: String { defaults.string(forKey: "mode") ?? "auto" }
     var answerLanguage: String { defaults.string(forKey: "answerLanguage") ?? "system" }
 
-    struct Capture { let text: String?; let imagePath: String?; let preview: String }
+    struct Capture { let text: String?; let imagePath: String?; let preview: String; var tables: [Table] = [] }
     var lastCapture: Capture?
 
     func applicationWillTerminate(_ n: Notification) { stopWarm() }
@@ -1071,6 +1118,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if a.contains("--demo-busy") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.setBusy(true) } }
         if a.contains("--demo-pin") { DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.popup.togglePin() } }
         if a.contains("--demo-history") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.openHistory() } }
+        if let secs = value("--extract-table-after").flatMap(Double.init) {   // test: ask Claude for the table
+            DispatchQueue.main.asyncAfter(deadline: .now() + secs) { self.extractTable() }
+        }
+        if let secs = value("--copy-table-after").flatMap(Double.init) {      // test: press Copy table
+            DispatchQueue.main.asyncAfter(deadline: .now() + secs) { self.popup.copyTable() }
+        }
         if let file = value("--ocr-file") {   // test: treat an image file as a screen capture
             testMode = value("--mode")
             DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
@@ -1494,6 +1547,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mini.hide()
         miniPending = nil
         popup.mode = s.mode
+        popup.captureTables = s.tables
         popup.allowReplace = s.replace
         var chat = history.chat(s.chatID)
         if let id = s.entryID, let i = chat.firstIndex(where: { $0.id == id }) { chat = Array(chat[...i]) }
@@ -1882,7 +1936,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         p.terminationHandler = { [weak self] _ in
             let exists = FileManager.default.fileExists(atPath: path)
             if exists { DispatchQueue.main.async { self?.setBusy(true) } }
-            let r = exists ? recognizeText(at: path) : ("", "")
+            let r = exists ? recognizeText(at: path) : ("", "", [])
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.capturing = false
@@ -1893,12 +1947,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// A capture was read: text goes to Claude as text; a capture with no text goes as an image.
-    func captured(_ r: (text: String, forClaude: String), imagePath: String) {
+    func captured(_ r: (text: String, forClaude: String, tables: [Table]), imagePath: String) {
         let t = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.isEmpty {
             lastCapture = Capture(text: nil, imagePath: imagePath, preview: "🖼  Captured image")
         } else {
-            lastCapture = Capture(text: r.forClaude.trimmingCharacters(in: .whitespacesAndNewlines), imagePath: imagePath, preview: t)
+            lastCapture = Capture(text: r.forClaude.trimmingCharacters(in: .whitespacesAndNewlines), imagePath: imagePath, preview: t, tables: r.tables)
             if Settings.copyCapture {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(t, forType: .string)
@@ -1913,6 +1967,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let c = lastCapture, c.text != nil, let p = c.imagePath else { return false }
         return FileManager.default.fileExists(atPath: p)
     }
+    /// For tables the on-device reader misses (dark backgrounds, merged cells, older macOS):
+    /// Claude reads the image and returns the table, which "Copy table" then copies.
+    var canExtractTable: Bool {
+        guard let p = lastCapture?.imagePath else { return false }
+        return FileManager.default.fileExists(atPath: p)
+    }
+    @objc func extractTable() {
+        guard canExtractTable, let c = lastCapture else { NSSound.beep(); return }
+        run(Capture(text: nil, imagePath: c.imagePath, preview: c.preview), modeID: popup.mode, again: true,
+            task: ("Table", "Extract the table in the image. Return only a Markdown table with the same rows and columns, keeping every number and word exactly as written, with no commentary before or after. If there are several tables, return each as its own Markdown table."))
+    }
+
     @objc func rerunWithImage() {
         guard canSendImage, let c = lastCapture else { NSSound.beep(); return }
         run(Capture(text: nil, imagePath: c.imagePath, preview: c.preview), modeID: popup.mode, again: true)
@@ -1935,8 +2001,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Sends a capture with a mode. `again` = the same capture re-run from the pop-up.
-    func run(_ c: Capture, modeID: String, again: Bool) {
-        let m = mode(modeID)
+    func run(_ c: Capture, modeID: String, again: Bool, task: (label: String, instruction: String)? = nil) {
+        var m = mode(modeID)
+        if let task { m = Mode(id: m.id, label: task.label, symbol: m.symbol, instruction: task.instruction) }
+        popup.captureTables = c.tables
         let head = again ? (c.text == nil && c.imagePath != nil ? "Same capture as before; this time look at the image itself." : "Same capture as before, now in another mode.") : "New capture."
         let body: String
         if let t = c.text {
@@ -2013,7 +2081,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let footer = self.chatFooter()
                 self.popup.thread = self.history.chat(sessionID)
                 self.display(header: hdr, preview: preview, state: .result(text), footer: footer)
-                self.lastShown = Shown(header: hdr, preview: preview, text: text, mode: self.popup.mode, footer: footer, replace: followUp == nil, chatID: sessionID)
+                self.lastShown = Shown(header: hdr, preview: preview, text: text, mode: self.popup.mode, footer: footer, replace: followUp == nil, chatID: sessionID, tables: self.popup.captureTables)
                 if Settings.autoCopy {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(text, forType: .string)
@@ -2204,6 +2272,10 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
     var replaceBtn: HoverButton!
     var retryBtn: HoverButton!
     var fixBtn: HoverButton!      // "Sign in…" or "Set up…" on errors
+    var tableBtn: HoverButton!
+    /// Tables detected in the capture; a table in the answer takes priority.
+    var captureTables: [Table] = []
+    var tables: [Table] = []
 
     let frames = Pixel.clawdFrames(px: 2)
     let idleImage = Pixel.clawd(px: 2)
@@ -2347,7 +2419,8 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         copyBtn = actionButton("Copy", "⌘C", #selector(copyResult))
         retryBtn = actionButton("Try again", "", #selector(retry))
         fixBtn = actionButton("Sign in…", "", #selector(fixProblem), primary: true)
-        for b in [retryBtn, fixBtn, askBtn, replaceBtn, copyBtn] as [NSView] { actions.addArrangedSubview(b) }
+        tableBtn = actionButton("Copy table", "⇧⌘C", #selector(copyTable))
+        for b in [retryBtn, fixBtn, askBtn, replaceBtn, tableBtn, copyBtn] as [NSView] { actions.addArrangedSubview(b) }
         actions.orientation = .horizontal
         actions.spacing = 6
 
@@ -2441,6 +2514,7 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
             if let n = Int(ch), (1...modes.count).contains(n) { appDelegate?.rerun(modeID: modes[n - 1].id); return true }
             return false
         }
+        if mods == [.command, .shift], ch == "c" { copyTable(); return true }
         guard mods == .command else { return false }
         if e.keyCode == UInt16(kVK_Return) { if !replaceBtn.isHidden { replaceResult() }; return true }
         switch ch {
@@ -2576,6 +2650,7 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         add("Show the whole conversation", "rectangle.stack", #selector(toggleThread), key: "t", on: showThread, enabled: done && thread.count > 1)
         add("Keep open (pin)", "pin", #selector(togglePin), key: "p", on: pinned)
         add("Have Claude look at the image", "photo", #selector(AppDelegate.rerunWithImage), enabled: appDelegate?.canSendImage == true, target: appDelegate)
+        add("Extract the table with Claude", "tablecells", #selector(AppDelegate.extractTable), enabled: appDelegate?.canExtractTable == true, target: appDelegate)
         m.addItem(.separator())
         add("New chat", "square.and.pencil", #selector(newChat), key: "n")
         let export = NSMenuItem(title: "Export chat", action: nil, keyEquivalent: "")
@@ -2714,6 +2789,11 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         let needsSignIn = errorMessage.contains("not signed in"), needsSetup = errorMessage.contains("wasn't found")
         fixBtn.isHidden = !(isError && (needsSignIn || needsSetup))
         if !fixBtn.isHidden { setTitle(fixBtn, needsSignIn ? "Sign in…" : "Set up…", "", primary: true) }
+
+        let answerTables = done ? markdownTables(resultText) : []
+        tables = !answerTables.isEmpty ? answerTables : (isError ? [] : captureTables)
+        tableBtn.isHidden = tables.isEmpty
+        tableBtn.toolTip = (answerTables.isEmpty ? "Copy the captured table" : "Copy the table in the answer") + ", ready to paste into Excel, Sheets or Notion"
 
         let canThread = done && thread.count > 1
         var t = footerText
@@ -2907,6 +2987,13 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
             footerText = "Copied · press ⌘V to paste (Settings → Allow auto-paste)"
             updateBar()
         }
+    }
+
+    @objc func copyTable() {
+        guard !tables.isEmpty else { NSSound.beep(); return }
+        copyTables(tables)
+        appDelegate?.lastChange = NSPasteboard.general.changeCount  // don't treat this as a capture
+        flash(tableBtn, "Copy table", "⇧⌘C")
     }
 
     @objc func retry() { appDelegate?.retryLast() }

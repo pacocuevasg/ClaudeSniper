@@ -41,6 +41,7 @@ Already use [TextSniper](https://textsniper.app)? Its ⌘⇧2 captures are picke
 ### Features
 
 - **Built-in capture and OCR:** no other app needed. The text is read on your Mac in about half a second and also copied to your clipboard. Tables keep their rows and columns (macOS 26+), and a capture with no text is sent to Claude as an image.
+- **Copy table:** a captured table (or a table in Claude's answer) is copied as a real table that pastes into Excel, Numbers, Sheets, Notion or Word. If the on-device reader misses a table, **Extract the table with Claude** in the **⋯** menu gets it from the image.
 - **Have Claude look at the image:** when the text isn't enough (a diagram, a formula, tricky code), send the capture itself from the **⋯** menu.
 - **Live answers:** the text appears while Claude writes it, and the menu bar spark twinkles while Claude is answering.
 - **Rich answers:** headings, lists, tables, quotes and code blocks are rendered, not shown as raw Markdown.
@@ -74,6 +75,7 @@ Already use [TextSniper](https://textsniper.app)? Its ⌘⇧2 captures are picke
 | **Tab** | Ask a follow-up in the same chat |
 | **⌘C** | Copy the answer (or just the selected text) |
 | **⌘↩** | Replace: paste the result where you captured it (Fix and Translate) |
+| **⇧⌘C** | Copy table: the captured table, or the table in the answer |
 | **⌘T** | Show the whole conversation |
 | **⌘P** | Pin the pop-up open |
 | **⌘R** | Read aloud |
@@ -99,7 +101,7 @@ The **⋯** button has the same actions, plus Export chat and History.
   ```bash
   curl -fsSL https://claude.ai/install.sh | bash
   ```
-- Xcode Command Line Tools (to build): `xcode-select --install`.
+- Xcode Command Line Tools (to build): `xcode-select --install`. Table detection needs Xcode 26 to build and macOS 26 to run; everything else works from macOS 13.
 
 ## Installation
 
