@@ -1,7 +1,8 @@
-// ClaudeSniper — a companion for TextSniper.
-// Pixel-art menu bar icon with an on/off toggle. When it's on and you press ⌘⇧2 in
-// TextSniper, it sends the capture to Claude (through Claude Code, using your plan) and
-// shows the answer in a pop-up. Captures are grouped into a chat that expires after a
+// ClaudeSniper — capture anything on your screen and Claude explains it.
+// Pixel-art menu bar icon with an on/off toggle. Press ⌘⇧1 and drag over part of the
+// screen: the text is read on your Mac (Apple's Vision OCR) and sent to Claude (through
+// Claude Code, using your plan), and the answer shows in a pop-up. TextSniper captures
+// (⌘⇧2) are picked up too. Captures are grouped into a chat that expires after a
 // while without use (15 min by default, see Settings); you can start a new chat or switch.
 //
 // File map: settings and modes · design tokens and Markdown · chats and history ·
@@ -15,6 +16,7 @@ import ApplicationServices
 import AVFoundation
 import NaturalLanguage
 import UniformTypeIdentifiers
+import Vision
 
 let defaults = UserDefaults.standard
 let isDemo = CommandLine.arguments.contains { $0.hasPrefix("--demo") }
@@ -109,6 +111,8 @@ enum Settings {
     static var superFast: Bool { defaults.bool(forKey: "superFast") }
     /// Answers wait in a tiny Clawd instead of opening the pop-up.
     static var miniMode: Bool { defaults.bool(forKey: "miniMode") }
+    /// Also put the captured text on the clipboard, like an OCR tool.
+    static var copyCapture: Bool { defaults.object(forKey: "copyCapture") as? Bool ?? true }
 }
 let chatMemoryOptions: [(Any, String)] = [(0, "Off · every capture is a new chat"), (5, "5 minutes"), (10, "10 minutes"),
                                           (15, "15 minutes"), (30, "30 minutes"), (60, "1 hour")]
@@ -117,10 +121,11 @@ let lengthHint = ["short": "under 80 words", "normal": "under 200 words", "detai
 let positionOptions: [(Any, String)] = [("cursor", "Next to the cursor"), ("topRight", "Top-right corner"), ("center", "Center of the screen")]
 let autoCloseOptions: [(Any, String)] = [(0, "Never"), (15, "After 15 seconds"), (30, "After 30 seconds"), (60, "After 1 minute")]
 
-/// The capture shortcut. Defaults to TextSniper's ⌘⇧2; change it if you changed it in TextSniper.
-var hotkeyCode = defaults.object(forKey: "hotkeyCode") as? Int ?? Int(kVK_ANSI_2)
+/// ClaudeSniper's own capture shortcut (Settings → Change capture shortcut).
+let defaultHotkeyLabel = "⌘⇧1"
+var hotkeyCode = defaults.object(forKey: "hotkeyCode") as? Int ?? Int(kVK_ANSI_1)
 var hotkeyMods = UInt(defaults.object(forKey: "hotkeyMods") as? Int ?? Int(NSEvent.ModifierFlags([.command, .shift]).rawValue))
-var hotkeyLabel = defaults.string(forKey: "hotkeyLabel") ?? "⌘⇧2"
+var hotkeyLabel = defaults.string(forKey: "hotkeyLabel") ?? defaultHotkeyLabel
 
 func chatMemoryText() -> String {
     let m = Settings.chatMinutes
@@ -809,20 +814,78 @@ final class WarmProcess {
     }
 }
 
-// MARK: - Global shortcut to reopen the last answer (⌥⌘2, no permission needed)
+// MARK: - Global shortcuts (no permission needed): capture, and ⌥⌘2 for the last answer
 
-func registerShowLastHotkey() {
+var hotKeyRefs: [UInt32: EventHotKeyRef] = [:]
+let hotKeyShowLast: UInt32 = 1, hotKeyCapture: UInt32 = 2
+
+func installHotkeyHandler() {
     var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-    InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-        DispatchQueue.main.async { appDelegate?.showLast() }
+    InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+        var hk = EventHotKeyID()
+        GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil,
+                          MemoryLayout<EventHotKeyID>.size, nil, &hk)
+        let id = hk.id
+        DispatchQueue.main.async {
+            if id == hotKeyShowLast { appDelegate?.showLast() } else if id == hotKeyCapture { appDelegate?.captureScreen() }
+        }
         return noErr
     }, 1, &spec, nil, nil)
-    var ref: EventHotKeyRef?
-    RegisterEventHotKey(UInt32(kVK_ANSI_2), UInt32(cmdKey | optionKey),
-                        EventHotKeyID(signature: 0x434C534E, id: 1), GetApplicationEventTarget(), 0, &ref)
 }
 
-// MARK: - Hotkey (⌘⇧2 by default)
+/// Registers (or replaces) a global shortcut. Pass nil to remove it.
+func setHotkey(_ id: UInt32, code: Int?, mods: NSEvent.ModifierFlags = []) {
+    if let r = hotKeyRefs[id] { UnregisterEventHotKey(r); hotKeyRefs[id] = nil }
+    guard let code else { return }
+    var c: UInt32 = 0
+    if mods.contains(.command) { c |= UInt32(cmdKey) }
+    if mods.contains(.shift) { c |= UInt32(shiftKey) }
+    if mods.contains(.option) { c |= UInt32(optionKey) }
+    if mods.contains(.control) { c |= UInt32(controlKey) }
+    var ref: EventHotKeyRef?
+    RegisterEventHotKey(UInt32(code), c, EventHotKeyID(signature: 0x434C534E, id: id), GetApplicationEventTarget(), 0, &ref)
+    hotKeyRefs[id] = ref
+}
+
+// MARK: - Reading the screen (local OCR with Apple's Vision)
+
+/// Reads the text in an image, on this Mac. If it contains tables (macOS 26+), the text is
+/// read row by row and each table is added as Markdown so Claude sees its structure.
+func recognizeText(at path: String) -> (text: String, forClaude: String) {
+    guard let img = NSImage(contentsOfFile: path)?.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return ("", "") }
+    let req = VNRecognizeTextRequest()
+    req.recognitionLevel = .accurate
+    req.usesLanguageCorrection = true
+    req.automaticallyDetectsLanguage = true
+    try? VNImageRequestHandler(cgImage: img).perform([req])
+    let classic = (req.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+
+    if #available(macOS 26.0, *) {
+        var transcript = "", tables: [String] = []
+        let sem = DispatchSemaphore(value: 0)
+        Task.detached {
+            if let doc = try? await RecognizeDocumentsRequest().perform(on: img, orientation: nil).first?.document {
+                transcript = doc.text.transcript
+                for t in doc.tables where t.rows.count > 1 {
+                    var md = ""
+                    for (r, row) in t.rows.enumerated() {
+                        md += "| " + row.map { $0.content.text.transcript.replacingOccurrences(of: "\n", with: " ") }.joined(separator: " | ") + " |\n"
+                        if r == 0 { md += "|" + String(repeating: "---|", count: row.count) + "\n" }
+                    }
+                    tables.append(md)
+                }
+            }
+            sem.signal()
+        }
+        _ = sem.wait(timeout: .now() + 8)
+        if !tables.isEmpty, !transcript.isEmpty {
+            return (transcript, transcript + "\n\nThe capture contains a table. Its structure:\n\n" + tables.joined(separator: "\n"))
+        }
+    }
+    return (classic, classic)
+}
+
+// MARK: - TextSniper's ⌘⇧2 (optional, only with Input Monitoring; its overlay is detected anyway)
 
 weak var appDelegate: AppDelegate?
 
@@ -839,7 +902,7 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
         if f.contains(.maskShift) { m.insert(.shift) }
         if f.contains(.maskControl) { m.insert(.control) }
         if f.contains(.maskAlternate) { m.insert(.option) }
-        if code == Int64(hotkeyCode), m.rawValue == hotkeyMods {
+        if code == Int64(kVK_ANSI_2), m == [.command, .shift] {
             DispatchQueue.main.async { appDelegate?.hotkeyPressed() }
         }
     }
@@ -925,7 +988,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         get { defaults.bool(forKey: "enabled") }
         set {
             defaults.set(newValue, forKey: "enabled"); updateIcon()
-            if newValue { startMonitoring(); prewarm() } else { stopMonitoring(); stopWarm() }
+            if newValue { startMonitoring(); prewarm(); registerCaptureHotkey() }
+            else { stopMonitoring(); stopWarm(); setHotkey(hotKeyCapture, code: nil) }
         }
     }
     var model: String { defaults.string(forKey: "model") ?? "haiku" }
@@ -973,7 +1037,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateIcon()
         if enabled { startMonitoring() }
         refreshAuth()
-        registerShowLastHotkey()
+        installHotkeyHandler()
+        setHotkey(hotKeyShowLast, code: Int(kVK_ANSI_2), mods: [.command, .option])
+        if enabled { registerCaptureHotkey() }
         installMainMenu()
         if let e = history.entries.last {   // so ⌥⌘2 and follow-ups work right after a restart
             lastSessionID = e.chatID
@@ -1005,6 +1071,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if a.contains("--demo-busy") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.setBusy(true) } }
         if a.contains("--demo-pin") { DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.popup.togglePin() } }
         if a.contains("--demo-history") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.openHistory() } }
+        if let file = value("--ocr-file") {   // test: treat an image file as a screen capture
+            testMode = value("--mode")
+            DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
+                let copy = workDir + "/capture-test-\(Int(Date().timeIntervalSince1970)).png"
+                try? FileManager.default.copyItem(atPath: file, toPath: copy)
+                let r = recognizeText(at: copy)
+                DispatchQueue.main.async { self.captured(r, imagePath: copy) }
+            }
+        }
         if a.contains("--interpret-clipboard") {
             testMode = value("--mode")
             pendingFollowUp = value("--follow-up")
@@ -1214,6 +1289,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(exportItem)
         menu.addItem(.separator())
 
+        let cap = item("Capture and ask Claude", "viewfinder", #selector(captureScreen))
+        cap.toolTip = "Drag over part of the screen (\(hotkeyLabel) when ClaudeSniper is on). Esc cancels."
+        menu.addItem(cap)
         menu.addItem(item("Interpret clipboard now", "wand.and.stars", #selector(testNow)))
         menu.addItem(settingsItem())
         menu.addItem(.separator())
@@ -1275,7 +1353,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let title = NSTextField(labelWithString: "ClaudeSniper")
         title.font = .systemFont(ofSize: 14, weight: .bold)
         title.frame = NSRect(x: 62, y: 29, width: 160, height: 18)
-        let sub = NSTextField(labelWithString: enabled ? "On · press \(hotkeyLabel) in TextSniper" : "Off")
+        let sub = NSTextField(labelWithString: enabled ? "On · press \(hotkeyLabel) to capture" : "Off")
         sub.font = .systemFont(ofSize: 11)
         sub.textColor = enabled ? claudeOrange : .secondaryLabelColor
         sub.frame = NSRect(x: 62, y: 12, width: 180, height: 15)
@@ -1549,6 +1627,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.addItem(choiceMenu("Close pop-up", "timer", key: "autoClose", options: autoCloseOptions,
                              isOn: { ($0 as? Int) == Settings.autoClose }))
         m.addItem(.separator())
+        let cc = item("Copy captured text to the clipboard", "text.viewfinder", #selector(toggleCopyCapture))
+        cc.state = Settings.copyCapture ? .on : .off
+        m.addItem(cc)
         m.addItem(toggle("Copy the answer automatically", "doc.on.clipboard", key: "autoCopy"))
         m.addItem(toggle("Play a sound when the answer arrives", "speaker.wave.2", key: "sound"))
         m.addItem(toggle("Mini Clawd: answers wait in a tiny Clawd", "face.smiling", key: "miniMode"))
@@ -1565,7 +1646,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.addItem(.separator())
         m.addItem(item("Change capture shortcut (\(hotkeyLabel))…", "keyboard", #selector(changeShortcut)))
         m.addItem(item("Welcome guide…", "hand.wave", #selector(openWelcome)))
-        if hotkeyLabel != "⌘⇧2" { m.addItem(item("Reset shortcut to ⌘⇧2", "arrow.uturn.backward", #selector(resetShortcut))) }
+        if hotkeyLabel != defaultHotkeyLabel { m.addItem(item("Reset shortcut to \(defaultHotkeyLabel)", "arrow.uturn.backward", #selector(resetShortcut))) }
         let clear = item("Clear all chats", "trash", #selector(clearChats))
         clear.isEnabled = !store.recent.isEmpty
         m.addItem(clear)
@@ -1576,6 +1657,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func choicePicked(_ i: NSMenuItem) { if let c = i.representedObject as? Choice { defaults.set(c.value, forKey: c.key) } }
     @objc func togglePicked(_ i: NSMenuItem) { if let k = i.representedObject as? String { defaults.set(!defaults.bool(forKey: k), forKey: k) } }
     @objc func clearChats() { store.clearAll() }
+    @objc func toggleCopyCapture() { defaults.set(!Settings.copyCapture, forKey: "copyCapture") }
     @objc func allowAutoPaste() {
         _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
     }
@@ -1591,7 +1673,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         p.title = "Capture shortcut"
         p.level = .floating
         p.isReleasedWhenClosed = false
-        let l = NSTextField(wrappingLabelWithString: "Press the shortcut you use in TextSniper.\nIt needs ⌘, ⌃ or ⌥. Esc cancels.")
+        let l = NSTextField(wrappingLabelWithString: "Press the shortcut you want for capturing.\nIt needs ⌘, ⌃ or ⌥. Esc cancels.")
         l.alignment = .center
         l.font = .systemFont(ofSize: 13)
         l.frame = NSRect(x: 20, y: 35, width: 320, height: 60)
@@ -1618,7 +1700,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func resetShortcut() {
-        setShortcut(code: Int(kVK_ANSI_2), mods: NSEvent.ModifierFlags([.command, .shift]).rawValue, label: "⌘⇧2")
+        setShortcut(code: Int(kVK_ANSI_1), mods: NSEvent.ModifierFlags([.command, .shift]).rawValue, label: defaultHotkeyLabel)
     }
 
     func setShortcut(code: Int, mods: UInt, label: String) {
@@ -1626,6 +1708,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         defaults.set(code, forKey: "hotkeyCode")
         defaults.set(Int(mods), forKey: "hotkeyMods")
         defaults.set(label, forKey: "hotkeyLabel")
+        if enabled { registerCaptureHotkey() }
+    }
+
+    func registerCaptureHotkey() {
+        setHotkey(hotKeyCapture, code: hotkeyCode, mods: NSEvent.ModifierFlags(rawValue: hotkeyMods))
     }
 
     func endRecording() {
@@ -1777,6 +1864,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return Settings.chatMinutes == 0 ? "Chat memory is off" : "New chat · your next capture starts fresh"
     }
 
+    // MARK: Capturing the screen
+
+    var capturing = false
+
+    /// Lets you drag over part of the screen (the system's own selection, like ⌘⇧4),
+    /// reads the text on this Mac and asks Claude. Esc cancels.
+    @objc func captureScreen() {
+        guard !capturing else { return }
+        capturing = true
+        lastActivity = Date()
+        prewarm()   // Fast: get a process ready while you select
+        let path = workDir + "/capture-\(Int(Date().timeIntervalSince1970)).png"
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        p.arguments = ["-i", "-x", "-t", "png", path]
+        p.terminationHandler = { [weak self] _ in
+            let exists = FileManager.default.fileExists(atPath: path)
+            if exists { DispatchQueue.main.async { self?.setBusy(true) } }
+            let r = exists ? recognizeText(at: path) : ("", "")
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.capturing = false
+                if exists { self.captured(r, imagePath: path) }   // no file: you pressed esc
+            }
+        }
+        do { try p.run() } catch { capturing = false; NSSound.beep() }
+    }
+
+    /// A capture was read: text goes to Claude as text; a capture with no text goes as an image.
+    func captured(_ r: (text: String, forClaude: String), imagePath: String) {
+        let t = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.isEmpty {
+            lastCapture = Capture(text: nil, imagePath: imagePath, preview: "🖼  Captured image")
+        } else {
+            lastCapture = Capture(text: r.forClaude.trimmingCharacters(in: .whitespacesAndNewlines), imagePath: imagePath, preview: t)
+            if Settings.copyCapture {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(t, forType: .string)
+                lastChange = NSPasteboard.general.changeCount   // our own copy isn't a new capture
+            }
+        }
+        run(lastCapture!, modeID: testMode ?? defaultMode, again: false)
+    }
+
+    /// The text reader missed something (a diagram, a formula, tricky code): let Claude see the image.
+    var canSendImage: Bool {
+        guard let c = lastCapture, c.text != nil, let p = c.imagePath else { return false }
+        return FileManager.default.fileExists(atPath: p)
+    }
+    @objc func rerunWithImage() {
+        guard canSendImage, let c = lastCapture else { NSSound.beep(); return }
+        run(Capture(text: nil, imagePath: c.imagePath, preview: c.preview), modeID: popup.mode, again: true)
+    }
+
     func handleClipboard() {
         let pb = NSPasteboard.general
         if let s = pb.string(forType: .string), !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -1796,7 +1937,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Sends a capture with a mode. `again` = the same capture re-run from the pop-up.
     func run(_ c: Capture, modeID: String, again: Bool) {
         let m = mode(modeID)
-        let head = again ? "Same capture as before, now in another mode." : "New capture."
+        let head = again ? (c.text == nil && c.imagePath != nil ? "Same capture as before; this time look at the image itself." : "Same capture as before, now in another mode.") : "New capture."
         let body: String
         if let t = c.text {
             body = "\(head)\nMODE: \(m.label) — \(m.instruction)\n\nCapture:\n\n\(t)"
@@ -1804,7 +1945,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             body = "\(head) It is an image: read it at \(c.imagePath!) with the Read tool.\nMODE: \(m.label) — \(m.instruction)"
         }
         popup.mode = m.id
-        ask(prompt: body, image: c.imagePath != nil, preview: c.preview)
+        ask(prompt: body, image: c.text == nil, preview: c.preview)
     }
 
     func rerun(modeID: String) {
@@ -2434,6 +2575,7 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         add(speech.isSpeaking ? "Stop reading" : "Read aloud", "speaker.wave.2", #selector(speak), key: "r", enabled: done)
         add("Show the whole conversation", "rectangle.stack", #selector(toggleThread), key: "t", on: showThread, enabled: done && thread.count > 1)
         add("Keep open (pin)", "pin", #selector(togglePin), key: "p", on: pinned)
+        add("Have Claude look at the image", "photo", #selector(AppDelegate.rerunWithImage), enabled: appDelegate?.canSendImage == true, target: appDelegate)
         m.addItem(.separator())
         add("New chat", "square.and.pencil", #selector(newChat), key: "n")
         let export = NSMenuItem(title: "Export chat", action: nil, keyEquivalent: "")
@@ -2998,7 +3140,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         let title = NSTextField(labelWithString: "Welcome to ClaudeSniper")
         title.font = .systemFont(ofSize: 22, weight: .bold)
         title.textColor = .white
-        let sub = NSTextField(wrappingLabelWithString: "Capture anything on your screen with TextSniper (⌘⇧2) and Claude explains it in a pop-up, using your Claude plan. A few quick checks:")
+        let sub = NSTextField(wrappingLabelWithString: "Press \(hotkeyLabel), drag over anything on your screen, and Claude explains it in a pop-up, using your Claude plan. A few quick checks:")
         sub.font = .systemFont(ofSize: 13)
         sub.textColor = .secondaryLabelColor
         sub.alignment = .center
@@ -3010,8 +3152,8 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         let specs: [(String, String, String, Selector)] = [
             ("Claude Code", "The free command-line tool that talks to Claude.", "Install…", #selector(installClaude)),
             ("Signed in to your Claude plan", "Pro or Max. It uses your plan, with no API key.", "Sign in…", #selector(signIn)),
-            ("TextSniper", "Copies text from anywhere on your screen with ⌘⇧2.", "Get TextSniper", #selector(getTextSniper)),
-            ("Try it", "See a real answer for a sample sentence.", "Try a sample", #selector(trySample)),
+            ("Capture", "Press \(hotkeyLabel) and drag over any text. Esc cancels.", "Try a capture", #selector(tryCapture)),
+            ("Sample", "Or see a real answer for a sample sentence.", "Try a sample", #selector(trySample)),
         ]
         for (name, detail, button, action) in specs {
             let icon = NSImageView()
@@ -3119,16 +3261,17 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
     @objc func refresh() {
         let hasClaude = findClaude() != nil
         set(0, hasClaude)
-        set(2, Self.textSniperInstalled())
-        set(3, false)
-        rows[3].icon.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(paletteColors: [claudeOrange]))
+        for (i, symbol) in [(2, "viewfinder"), (3, "sparkles")] {
+            rows[i].icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(paletteColors: [claudeOrange]))
+            rows[i].button.isEnabled = false
+        }
         rows[1].button.isEnabled = hasClaude
-        rows[3].button.isEnabled = false
         guard hasClaude else { set(1, false); return }
         set(1, nil)
         appDelegate?.refreshAuth { [weak self] ok in
             self?.set(1, ok)
+            self?.rows[2].button.isEnabled = ok
             self?.rows[3].button.isEnabled = ok
         }
     }
@@ -3146,7 +3289,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         NSWorkspace.shared.open(URL(fileURLWithPath: path))
     }
     @objc func signIn() { appDelegate?.login() }
-    @objc func getTextSniper() { NSWorkspace.shared.open(URL(string: "https://textsniper.app")!) }
+    @objc func tryCapture() { appDelegate?.captureScreen() }
     @objc func trySample() { appDelegate?.trySample() }
     @objc func finish() {
         defaults.set(true, forKey: "onboarded")

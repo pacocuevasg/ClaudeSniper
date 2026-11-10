@@ -4,16 +4,16 @@
 
 # ClaudeSniper
 
-**Capture anything on your screen with TextSniper and get Claude's take on it instantly.**
+**Capture anything on your screen and get Claude's take on it instantly.**
 
-A native macOS menu bar app that connects [TextSniper](https://textsniper.app) to Claude, using **your Claude plan** (no API key).
+A native macOS menu bar app with its own screen capture and on-device text recognition, using **your Claude plan** (no API key).
 
 ![macOS 13+](https://img.shields.io/badge/macOS-13%2B-black?logo=apple)
 ![Swift](https://img.shields.io/badge/Swift-single%20file-F05138?logo=swift&logoColor=white)
 ![Claude Code](https://img.shields.io/badge/Claude%20Code-your%20plan-D97757)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
 
-<a href="docs/claudesniper-demo.mp4"><img src="docs/claudesniper-demo.gif" width="720" alt="ClaudeSniper demo: press ⌘⇧2, select text, and Claude answers in a pop-up"></a>
+<a href="docs/claudesniper-demo.mp4"><img src="docs/claudesniper-demo.gif" width="720" alt="ClaudeSniper demo: capture some text and Claude answers in a pop-up"></a>
 
 <sub>▶ <a href="docs/claudesniper-demo.mp4">Watch the 31-second demo with sound (MP4)</a></sub>
 
@@ -23,8 +23,10 @@ A native macOS menu bar app that connects [TextSniper](https://textsniper.app) t
 
 ## What it does
 
-1. Press **⌘⇧2** and select part of your screen with TextSniper: a definition, an exam question, some code, a paragraph in another language…
-2. ClaudeSniper picks up the capture and sends it to Claude.
+1. Press **⌘⇧1** and drag over part of your screen: a definition, an exam question, some code, a table, a paragraph in another language…
+2. ClaudeSniper reads the text on your Mac (Apple's Vision OCR, offline) and sends it to Claude.
+
+Already use [TextSniper](https://textsniper.app)? Its ⌘⇧2 captures are picked up too.
 3. A **pop-up appears next to your cursor** with the answer. No chat window to open.
 
 <div align="center">
@@ -38,6 +40,8 @@ A native macOS menu bar app that connects [TextSniper](https://textsniper.app) t
 
 ### Features
 
+- **Built-in capture and OCR:** no other app needed. The text is read on your Mac in about half a second and also copied to your clipboard. Tables keep their rows and columns (macOS 26+), and a capture with no text is sent to Claude as an image.
+- **Have Claude look at the image:** when the text isn't enough (a diagram, a formula, tricky code), send the capture itself from the **⋯** menu.
 - **Live answers:** the text appears while Claude writes it, and the menu bar spark twinkles while Claude is answering.
 - **Rich answers:** headings, lists, tables, quotes and code blocks are rendered, not shown as raw Markdown.
 - **Model:** ⚡ Fast · Haiku · Sonnet · Opus · Fable. **Effort:** from *low* (seconds) to *max*.
@@ -91,7 +95,6 @@ The **⋯** button has the same actions, plus Export chat and History.
 ## Requirements
 
 - macOS 13 Ventura or later.
-- [TextSniper](https://textsniper.app) with its default **⌘⇧2** shortcut.
 - [Claude Code](https://claude.com/claude-code) installed and signed in with your Claude account (Pro or Max):
   ```bash
   curl -fsSL https://claude.ai/install.sh | bash
@@ -119,24 +122,24 @@ open /Applications/ClaudeSniper.app
 
 ### First launch
 
-A **welcome guide** checks that Claude Code is installed, helps you sign in, checks for TextSniper and lets you try a sample answer. You can reopen it from **Settings → Welcome guide**.
+A **welcome guide** checks that Claude Code is installed, helps you sign in and lets you try a capture or a sample answer. You can reopen it from **Settings → Welcome guide**.
 
 1. **Sign in to Claude…** opens Terminal with `claude auth login`.
-2. Flip the switch on, pick a model, effort and mode, and try ⌘⇧2 in TextSniper.
+2. Flip the switch on, pick a model, effort and mode, and press ⌘⇧1 (change it in **Settings → Change capture shortcut**).
 
-No keyboard permission is needed: ClaudeSniper notices TextSniper's capture overlay when the text is copied.
+The capture uses macOS's own selection (the same as ⌘⇧4), so you pick exactly what ClaudeSniper sees. If macOS asks to let ClaudeSniper record the screen, allow it in *System Settings → Privacy & Security → Screen & System Audio Recording*.
 
 > [!TIP]
 > To preview the pop-up without using your plan: `open /Applications/ClaudeSniper.app --args --demo` (or `--demo-mini` for Mini Clawd)
 >
-> To test without TextSniper, copy some text and run `open /Applications/ClaudeSniper.app --args --interpret-clipboard --mode explain`
+> To test without capturing: `open /Applications/ClaudeSniper.app --args --ocr-file some-image.png --mode explain` reads an image file, and `--interpret-clipboard` uses the text on your clipboard.
 
 ## How it works
 
 ```
-⌘⇧2 in TextSniper ──► capture overlay on screen
+⌘⇧1 ──► drag over part of the screen (the system's own selection)
                                          │
-TextSniper copies the text ──► clipboard changes while the overlay is up
+              text read on your Mac with Apple's Vision OCR (~0.4 s)
                                          │
                                          ▼
           claude -p --model … --effort … --session-id / --resume <chat>
@@ -151,8 +154,9 @@ TextSniper copies the text ──► clipboard changes while the overlay is up
 
 ## Privacy
 
-- No keyboard monitoring is needed: ClaudeSniper only checks whether TextSniper's capture window is on screen when the clipboard changes. (If you do allow *Input Monitoring*, it also listens for your capture shortcut with a listen-only event tap that never blocks or changes keys.)
-- Only what TextSniper copies is sent to Claude (or what you send with "Interpret clipboard now").
+- **Text recognition happens on your Mac** (Apple's Vision framework). Only the recognized text is sent to Claude; the image itself is sent only for captures with no text, or when you choose "Have Claude look at the image".
+- You select what gets captured, with macOS's own selection. Nothing is captured in the background.
+- No keyboard monitoring: the shortcuts are regular global hotkeys. For TextSniper users, ClaudeSniper only checks whether TextSniper's capture window is on screen when the clipboard changes.
 - Conversations are stored where Claude Code keeps its sessions (`~/.claude/projects/`). The answer history is a local file (`~/Library/Application Support/ClaudeSniper/history.json`, last 500 answers) that you can clear from the History window. Temporary image captures are deleted after 24 hours.
 - **Replace** pastes automatically only if you allow *Accessibility* (Settings → Allow auto-paste); otherwise it copies and you press ⌘V. **Export to Notes** asks macOS for permission to control Notes the first time.
 
