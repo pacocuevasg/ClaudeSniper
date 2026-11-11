@@ -52,7 +52,16 @@ PLIST
 mkdir -p "$BUILD/Contents/Resources"
 cp AppIcon.icns "$BUILD/Contents/Resources/AppIcon.icns"
 
-codesign --force --deep -s - "$BUILD"
+# Sign with the local identity from tools/make_signing_cert.sh when it exists:
+# a stable signature lets macOS remember Screen Recording across rebuilds.
+# Otherwise (and on CI) sign ad hoc.
+SIGN_ID=${SIGN_ID:-"ClaudeSniper Local"}
+if [[ -z "$NO_INSTALL" ]] && security find-certificate -c "$SIGN_ID" >/dev/null 2>&1; then
+  codesign --force --deep -s "$SIGN_ID" "$BUILD"
+  echo "Signed with \"$SIGN_ID\""
+else
+  codesign --force --deep -s - "$BUILD"
+fi
 if [[ -n "$NO_INSTALL" ]]; then
   echo "Built $BUILD ($(lipo -archs "$BUILD/Contents/MacOS/ClaudeSniper"))"
   exit 0

@@ -918,7 +918,7 @@ final class WarmProcess {
 // MARK: - Global shortcuts (no permission needed): capture, and ⌥⌘2 for the last answer
 
 var hotKeyRefs: [UInt32: EventHotKeyRef] = [:]
-let hotKeyShowLast: UInt32 = 1, hotKeyCapture: UInt32 = 2, hotKeyTextOnly: UInt32 = 3
+let hotKeyShowLast: UInt32 = 1, hotKeyCapture: UInt32 = 2, hotKeyTextOnly: UInt32 = 3, hotKeyShot: UInt32 = 4, hotKeyScroll: UInt32 = 5
 
 func installHotkeyHandler() {
     var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
@@ -930,6 +930,8 @@ func installHotkeyHandler() {
         DispatchQueue.main.async {
             if id == hotKeyShowLast { appDelegate?.showLast() } else if id == hotKeyCapture { appDelegate?.captureScreen() }
             else if id == hotKeyTextOnly { appDelegate?.captureTextOnly() }
+            else if id == hotKeyShot { appDelegate?.takeScreenshot() }
+            else if id == hotKeyScroll { appDelegate?.scrollingCapture() }
         }
         return noErr
     }, 1, &spec, nil, nil)
@@ -1098,7 +1100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set {
             defaults.set(newValue, forKey: "enabled"); updateIcon()
             if newValue { startMonitoring(); prewarm(); registerCaptureHotkey() }
-            else { stopMonitoring(); stopWarm(); setHotkey(hotKeyCapture, code: nil); setHotkey(hotKeyTextOnly, code: nil) }
+            else { stopMonitoring(); stopWarm(); for id in [hotKeyCapture, hotKeyTextOnly, hotKeyShot, hotKeyScroll] { setHotkey(id, code: nil) } }
         }
     }
     var model: String { defaults.string(forKey: "model") ?? "haiku" }
@@ -1186,6 +1188,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if a.contains("--demo-busy") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.setBusy(true) } }
         if a.contains("--demo-pin") { DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.popup.togglePin() } }
         if a.contains("--demo-history") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.openHistory() } }
+        if let img = value("--demo-shot") {      // the thumbnail overlay for an image file
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                QuickAccess.shared.show(img)
+                if a.contains("--demo-pin-shot") { PinnedShot.show(img) }
+            }
+        }
+        if let tall = value("--stitch-test"), let out = value("--stitch-out"),
+           let img = NSImage(contentsOfFile: tall)?.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            // Slices a tall image into overlapping frames, as if a page scrolled, and joins them again.
+            let st = Stitcher(), h = 900
+            var y = 0, log = [String]()
+            for stepBy in [0, 137, 262, 90, 410, 333, 58, 480, 205, 377, 512, 144, 290, 466, 121, 350, 600, 0, 75, 230] {
+                y = min(y + stepBy, img.height - h)
+                if let f = img.cropping(to: CGRect(x: 0, y: y, width: img.width, height: h)) { log.append("\(st.add(f))") }
+            }
+            let ok = st.image().map { savePNG($0, to: out) } ?? false
+            print("stitched height \(st.totalHeight), expected \(y + h), saved \(ok): \(log.joined(separator: " "))")
+            exit(0)
+        }
         if let secs = value("--extract-table-after").flatMap(Double.init) {   // test: ask Claude for the table
             DispatchQueue.main.asyncAfter(deadline: .now() + secs) { self.extractTable() }
         }
@@ -1342,6 +1363,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if loggedIn == false {
             menu.addItem(status(false, "Sign in to Claude…", action: #selector(login)))
         }
+        if !hasScreenAccess {
+            menu.addItem(status(false, "Allow screen recording…", action: #selector(askScreenAccess)))
+        }
         menu.addItem(.separator())
 
         // How Claude answers
@@ -1425,6 +1449,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         only.keyEquivalentModifierMask = [.option, .command]
         only.toolTip = "Read the text and copy it, without asking Claude."
         menu.addItem(only)
+        let phone = item("Import from iPhone or iPad", "iphone", nil)
+        phone.identifier = NSMenuItem.importFromDeviceIdentifier   // macOS adds "Take Photo" and "Scan Documents"
+        phone.submenu = NSMenu()
+        menu.addItem(phone)
+        let shotItem = item("Screenshot", "camera.viewfinder", nil)
+        let sm = NSMenu()
+        let area = item("Area", "rectangle.dashed", #selector(takeScreenshot))
+        area.keyEquivalent = "3"
+        area.keyEquivalentModifierMask = [.option, .command]
+        sm.addItem(area)
+        sm.addItem(item("Window", "macwindow", #selector(takeWindowShot)))
+        let scrollItem = item("Scrolling capture", "arrow.up.and.down.text.horizontal", #selector(scrollingCapture))
+        scrollItem.keyEquivalent = "4"
+        scrollItem.keyEquivalentModifierMask = [.option, .command]
+        scrollItem.toolTip = "Pick an area, scroll the page, and get one tall screenshot."
+        sm.addItem(scrollItem)
+        shotItem.submenu = sm
+        menu.addItem(shotItem)
         menu.addItem(item("Interpret clipboard now", "wand.and.stars", #selector(testNow)))
         menu.addItem(settingsItem())
         menu.addItem(.separator())
@@ -1852,6 +1894,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func registerCaptureHotkey() {
         setHotkey(hotKeyCapture, code: hotkeyCode, mods: NSEvent.ModifierFlags(rawValue: hotkeyMods))
         setHotkey(hotKeyTextOnly, code: Int(kVK_ANSI_1), mods: [.command, .option])   // ⌥⌘1: copy the text only
+        setHotkey(hotKeyShot, code: Int(kVK_ANSI_3), mods: [.command, .option])       // ⌥⌘3: screenshot
+        setHotkey(hotKeyScroll, code: Int(kVK_ANSI_4), mods: [.command, .option])     // ⌥⌘4: scrolling capture
     }
 
     func endRecording() {
@@ -2001,6 +2045,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return "Chat · \(c.count) capture\(c.count == 1 ? "" : "s") · \(ChatStore.minutesLeft(c)) min left"
         }
         return Settings.chatMinutes == 0 ? "Chat memory is off" : "New chat · your next capture starts fresh"
+    }
+
+    // MARK: Screen recording permission
+
+    /// Without it, macOS asks on every capture, and scrolling capture can't work.
+    var hasScreenAccess: Bool { CGPreflightScreenCaptureAccess() }
+
+    @objc func askScreenAccess() {
+        CGRequestScreenCaptureAccess()   // adds ClaudeSniper to the list in System Settings
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+    }
+
+    func explainScreenAccess() {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "Scrolling capture needs screen recording"
+        a.informativeText = "Turn on ClaudeSniper in System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen ClaudeSniper."
+        a.addButton(withTitle: "Open Settings")
+        a.addButton(withTitle: "Cancel")
+        if a.runModal() == .alertFirstButtonReturn { askScreenAccess() }
+    }
+
+    // MARK: Screenshots
+
+    @objc func takeScreenshot() { shoot(["-i"]) }
+    @objc func takeWindowShot() { shoot(["-i", "-W"]) }
+    @objc func scrollingCapture() { ScrollCapture.start() }
+
+    /// A plain screenshot: the system's selection, then the thumbnail overlay.
+    func shoot(_ flags: [String]) {
+        guard !capturing else { return }
+        capturing = true
+        let path = workDir + "/shot-\(Int(Date().timeIntervalSince1970)).png"
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        p.arguments = flags + ["-x", "-t", "png", path]
+        p.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.capturing = false
+                if FileManager.default.fileExists(atPath: path) { QuickAccess.shared.show(path) }
+            }
+        }
+        do { try p.run() } catch { capturing = false; NSSound.beep() }
+    }
+
+    /// Reads an image we already have (a screenshot, a photo from the iPhone) like a capture.
+    func readImage(at source: String, kind: CaptureKind) {
+        let path = workDir + "/capture-\(Int(Date().timeIntervalSince1970))-\(Int.random(in: 100...999)).png"
+        guard (try? FileManager.default.copyItem(atPath: source, toPath: path)) != nil else { NSSound.beep(); return }
+        if kind != .textOnly { setBusy(true); prewarm() }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = recognizeText(at: path)
+            DispatchQueue.main.async { self.captured(r, imagePath: path, kind: kind) }
+        }
+    }
+
+    // MARK: Import from iPhone or iPad (Continuity Camera)
+
+    /// macOS fills the "Import from iPhone or iPad" menu when something accepts an image.
+    @objc func validRequestor(forSendType sendType: NSPasteboard.PasteboardType?, returnType: NSPasteboard.PasteboardType?) -> Any? {
+        if let t = returnType, NSImage.imageTypes.contains(t.rawValue) { return self }
+        return nil
+    }
+
+    /// The photo or scan taken with the phone arrives here.
+    @objc func readSelection(from pboard: NSPasteboard) -> Bool {
+        guard let img = NSImage(pasteboard: pboard), let tiff = img.tiffRepresentation,
+              let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else { return false }
+        let tmp = NSTemporaryDirectory() + "claudesniper-phone-\(UUID().uuidString).png"
+        guard (try? png.write(to: URL(fileURLWithPath: tmp))) != nil else { return false }
+        readImage(at: tmp, kind: .ask)
+        return true
     }
 
     // MARK: Capturing the screen
@@ -2380,6 +2496,7 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
     let clawdView = NSImageView()
     let titleLabel = NSTextField(labelWithString: "Claude")
     let chip = NSTextField(labelWithString: "")
+    let chipBox = NSView()        // the pill behind the model label
     var stopBtn: HoverButton!     // only while reading aloud
     var pinBtn: HoverButton!
     var moreBtn: HoverButton!
@@ -2474,9 +2591,11 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         titleLabel.textColor = .white
         chip.font = .systemFont(ofSize: 10.5, weight: .semibold)
         chip.textColor = Theme.accentSoft
-        chip.wantsLayer = true
-        chip.layer?.backgroundColor = Theme.accent.withAlphaComponent(0.18).cgColor
-        chip.layer?.cornerRadius = 9
+        chipBox.wantsLayer = true
+        chipBox.layer?.backgroundColor = Theme.accent.withAlphaComponent(0.18).cgColor
+        chipBox.layer?.cornerRadius = 9
+        chip.translatesAutoresizingMaskIntoConstraints = false
+        chipBox.addSubview(chip)
 
         stopBtn = iconButton("stop.fill", "Stop reading aloud", #selector(speak))
         stopBtn.contentTintColor = Theme.accent
@@ -2563,7 +2682,7 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         askField.target = self
         askField.action = #selector(askSubmitted)
 
-        let all: [NSView] = [tint, clawdView, titleLabel, chip, headerButtons, quoteBox, modeBar,
+        let all: [NSView] = [tint, clawdView, titleLabel, chipBox, headerButtons, quoteBox, modeBar,
                              scroll, divider, statusBtn, actions, askField]
         for v in all { v.translatesAutoresizingMaskIntoConstraints = false; bg.addSubview(v) }
         for v in [quoteBar, quoteLabel] { v.translatesAutoresizingMaskIntoConstraints = false; quoteBox.addSubview(v) }
@@ -2580,9 +2699,12 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
             clawdView.heightAnchor.constraint(equalToConstant: 24),
             titleLabel.leadingAnchor.constraint(equalTo: clawdView.trailingAnchor, constant: 9),
             titleLabel.centerYAnchor.constraint(equalTo: clawdView.centerYAnchor),
-            chip.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 8),
-            chip.centerYAnchor.constraint(equalTo: clawdView.centerYAnchor),
-            chip.heightAnchor.constraint(equalToConstant: 18),
+            chipBox.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 8),
+            chipBox.centerYAnchor.constraint(equalTo: clawdView.centerYAnchor),
+            chipBox.heightAnchor.constraint(equalToConstant: 18),
+            chip.leadingAnchor.constraint(equalTo: chipBox.leadingAnchor, constant: 8),
+            chip.trailingAnchor.constraint(equalTo: chipBox.trailingAnchor, constant: -8),
+            chip.centerYAnchor.constraint(equalTo: chipBox.centerYAnchor),
             headerButtons.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -10),
             headerButtons.centerYAnchor.constraint(equalTo: clawdView.centerYAnchor),
 
@@ -2835,7 +2957,7 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
     private func render(header: String, preview: String, state: State, footer: String) {
         lastArgs = (header, preview, footer)
         footerText = footer
-        chip.stringValue = "  \(header)  "
+        chip.stringValue = header
         let pv = preview.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
         quoteLabel.stringValue = pv.isEmpty ? "—" : pv
         var streaming = false
@@ -3197,6 +3319,515 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
     }
 }
 
+// MARK: - Screenshots: thumbnail overlay, pinned images, scrolling capture
+
+func savePNG(_ image: CGImage, to path: String) -> Bool {
+    guard let d = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else { return false }
+    return (try? d.write(to: URL(fileURLWithPath: path))) != nil
+}
+
+/// A borderless window that can take the keyboard (for esc and return).
+final class KeyWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+}
+
+/// The screenshot thumbnail: click and drag it into any app to drop the image file there.
+final class ShotThumb: NSImageView, NSDraggingSource {
+    var fileURL: URL?
+    private var down = NSPoint.zero
+    private var dragging = false
+
+    override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true }
+    override func mouseDown(with e: NSEvent) { down = e.locationInWindow; dragging = false }
+    override func mouseDragged(with e: NSEvent) {
+        guard !dragging, let url = fileURL,
+              hypot(e.locationInWindow.x - down.x, e.locationInWindow.y - down.y) > 4 else { return }
+        dragging = true
+        let item = NSDraggingItem(pasteboardWriter: url as NSURL)
+        item.setDraggingFrame(bounds, contents: image)
+        beginDraggingSession(with: [item], event: e, source: self)
+    }
+    func draggingSession(_ s: NSDraggingSession, sourceOperationMaskFor c: NSDraggingContext) -> NSDragOperation { .copy }
+}
+
+/// After a screenshot: a small thumbnail in the corner with what you can do with it.
+final class QuickAccess: NSObject {
+    static let shared = QuickAccess()
+    var panel: NSPanel?
+    var path = ""
+    var hideWork: DispatchWorkItem?
+
+    func show(_ path: String) {
+        panel?.orderOut(nil)
+        guard let img = NSImage(contentsOfFile: path) else { return }
+        self.path = path
+        let s = min(260 / img.size.width, 170 / img.size.height, 1)
+        let tw = max(img.size.width * s, 216), th = max(img.size.height * s, 70)
+        let w = tw + 16, h = th + 16 + 34
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: w, height: h), styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = true
+        p.level = .floating
+        p.isReleasedWhenClosed = false
+        p.hidesOnDeactivate = false
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        p.appearance = NSAppearance(named: .darkAqua)
+        let bg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        bg.material = .hudWindow
+        bg.state = .active
+        bg.blendingMode = .behindWindow
+        bg.maskImage = PopupController.roundedMask(14)
+        p.contentView = bg
+
+        let thumb = ShotThumb(frame: NSRect(x: 8, y: 42, width: tw, height: th))
+        thumb.image = img
+        thumb.imageScaling = .scaleProportionallyUpOrDown
+        thumb.fileURL = URL(fileURLWithPath: path)
+        thumb.wantsLayer = true
+        thumb.layer?.cornerRadius = 8
+        thumb.layer?.masksToBounds = true
+        thumb.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.25).cgColor
+        thumb.toolTip = "Drag into any app to drop the image"
+        bg.addSubview(thumb)
+
+        let specs: [(String, String, Selector)] = [
+            ("doc.on.doc", "Copy the image", #selector(copyImage)),
+            ("square.and.arrow.down", "Save to the Desktop", #selector(save)),
+            ("sparkles", "Ask Claude about it", #selector(ask)),
+            ("text.viewfinder", "Copy its text", #selector(copyText)),
+            ("pin", "Pin it on screen", #selector(pin)),
+            ("xmark", "Close", #selector(hide)),
+        ]
+        let gap = (w - 16 - CGFloat(specs.count) * 30) / CGFloat(specs.count - 1)
+        for (i, (symbol, tip, action)) in specs.enumerated() {
+            let b = HoverButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: tip)!, target: self, action: action)
+            b.isBordered = false
+            b.contentTintColor = symbol == "sparkles" ? Theme.accentSoft : Theme.ink2
+            b.symbolConfiguration = .init(pointSize: 13, weight: .semibold)
+            b.toolTip = tip
+            b.apply()
+            b.layer?.cornerRadius = 6
+            b.frame = NSRect(x: 8 + CGFloat(i) * (30 + gap), y: 8, width: 30, height: 26)
+            bg.addSubview(b)
+        }
+
+        let vf = (NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main!).visibleFrame
+        p.setFrameOrigin(NSPoint(x: vf.minX + 20, y: vf.minY + 12))
+        p.alphaValue = 0
+        p.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.2
+            p.animator().alphaValue = 1
+            p.animator().setFrameOrigin(NSPoint(x: vf.minX + 20, y: vf.minY + 20))
+        }
+        panel = p
+        scheduleHide(15)
+    }
+
+    /// Goes away by itself, but not while the mouse is over it.
+    func scheduleHide(_ seconds: Double) {
+        hideWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self, let p = self.panel, p.isVisible else { return }
+            if NSMouseInRect(NSEvent.mouseLocation, p.frame, false) { self.scheduleHide(4) } else { self.hide() }
+        }
+        hideWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: w)
+    }
+
+    @objc func hide() {
+        hideWork?.cancel()
+        guard let p = panel else { return }
+        panel = nil
+        NSAnimationContext.runAnimationGroup({ $0.duration = 0.15; p.animator().alphaValue = 0 }, completionHandler: { p.orderOut(nil) })
+    }
+
+    @objc func copyImage() {
+        guard let img = NSImage(contentsOfFile: path) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects([img])
+        appDelegate?.lastChange = NSPasteboard.general.changeCount
+        Toast.show("Image copied")
+    }
+
+    @objc func save() {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+        let dest = home + "/Desktop/ClaudeSniper \(df.string(from: Date())).png"
+        do {
+            try FileManager.default.copyItem(atPath: path, toPath: dest)
+            Toast.show("Saved to the Desktop")
+        } catch { Toast.show("Couldn't save") }
+    }
+
+    @objc func ask() { hide(); appDelegate?.readImage(at: path, kind: .ask) }
+    @objc func copyText() { appDelegate?.readImage(at: path, kind: .textOnly) }
+    @objc func pin() { PinnedShot.show(path); hide() }
+}
+
+/// A screenshot that stays on top of everything. Drag to move, double-click to close.
+final class PinView: NSImageView {
+    override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true }
+    override func mouseDown(with e: NSEvent) {
+        if e.clickCount == 2 { PinnedShot.close(window) } else { window?.performDrag(with: e) }
+    }
+    override func rightMouseDown(with e: NSEvent) {
+        let m = NSMenu()
+        let c = NSMenuItem(title: "Copy", action: #selector(copyImage), keyEquivalent: "")
+        c.target = self
+        m.addItem(c)
+        let x = NSMenuItem(title: "Close", action: #selector(closePin), keyEquivalent: "")
+        x.target = self
+        m.addItem(x)
+        NSMenu.popUpContextMenu(m, with: e, for: self)
+    }
+    @objc func copyImage() {
+        guard let img = image else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects([img])
+        appDelegate?.lastChange = NSPasteboard.general.changeCount
+    }
+    @objc func closePin() { PinnedShot.close(window) }
+}
+
+enum PinnedShot {
+    static var windows: [NSWindow] = []
+
+    static func show(_ path: String) {
+        guard let img = NSImage(contentsOfFile: path), let vf = NSScreen.main?.visibleFrame else { return }
+        let s = min(1, vf.width * 0.6 / img.size.width, vf.height * 0.7 / img.size.height)
+        let size = NSSize(width: img.size.width * s, height: img.size.height * s)
+        let p = NSPanel(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless, .nonactivatingPanel, .resizable],
+                        backing: .buffered, defer: false)
+        p.level = .floating
+        p.hasShadow = true
+        p.isReleasedWhenClosed = false
+        p.hidesOnDeactivate = false
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        p.contentAspectRatio = size
+        let v = PinView(frame: NSRect(origin: .zero, size: size))
+        v.image = img
+        v.imageScaling = .scaleAxesIndependently
+        v.autoresizingMask = [.width, .height]
+        v.toolTip = "Drag to move · double-click to close"
+        p.contentView = v
+        p.center()
+        p.setFrameOrigin(NSPoint(x: p.frame.origin.x + CGFloat(windows.count) * 24, y: p.frame.origin.y - CGFloat(windows.count) * 24))
+        p.orderFrontRegardless()
+        windows.append(p)
+    }
+
+    static func close(_ w: NSWindow?) {
+        guard let w else { return }
+        w.orderOut(nil)
+        windows.removeAll { $0 === w }
+    }
+}
+
+/// Joins screenshots of the same area taken while the page scrolls into one tall image.
+/// Each new frame is matched against the previous one to find how far the content moved;
+/// only the new rows at the bottom are added.
+final class Stitcher {
+    static let cols = 48
+    private(set) var strips: [CGImage] = []
+    private(set) var totalHeight = 0
+    private var last: [UInt8] = []
+    private var width = 0, height = 0
+
+    /// Each row of the image as 48 gray values (first row = top).
+    static func signature(_ img: CGImage) -> [UInt8] {
+        var buf = [UInt8](repeating: 0, count: cols * img.height)
+        buf.withUnsafeMutableBytes { raw in
+            guard let ctx = CGContext(data: raw.baseAddress, width: cols, height: img.height, bitsPerComponent: 8, bytesPerRow: cols,
+                                      space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return }
+            ctx.interpolationQuality = .medium
+            ctx.draw(img, in: CGRect(x: 0, y: 0, width: cols, height: img.height))
+        }
+        return buf
+    }
+
+    enum Result { case first, added(Int), same, lost }
+
+    func add(_ img: CGImage) -> Result {
+        let sig = Self.signature(img)
+        if strips.isEmpty || img.width != width || img.height != height {
+            strips = [img]; totalHeight = img.height; last = sig; width = img.width; height = img.height
+            return .first
+        }
+        let h = height, cols = Self.cols
+        // How much detail each row has (blank rows score 0). Blank rows match anything, so the
+        // rows with text and edges decide where the two frames overlap.
+        func detail(_ g: [UInt8]) -> [Int] {
+            (0..<h).map { y in
+                var t = 0
+                let r = y * cols
+                for c in 1..<cols { t += abs(Int(g[r + c]) - Int(g[r + c - 1])) }
+                return t
+            }
+        }
+        let texOld = detail(last), texNew = detail(sig)
+        // Skip the top strip: a sticky header doesn't move with the page.
+        let top = h / 8
+        var bestD = 0, bestScore = Double.infinity, bestWeight = 0
+        sig.withUnsafeBufferPointer { new in
+            last.withUnsafeBufferPointer { old in
+                for d in 0...(h * 7 / 10) {
+                    var num = 0, den = 0
+                    var y = top
+                    while y < h - d {
+                        let w = texOld[y + d] + texNew[y]
+                        if w > 0 {
+                            let a = y * cols, b = (y + d) * cols
+                            var diff = 0
+                            for c in 0..<cols { diff += abs(Int(new[a + c]) - Int(old[b + c])) }
+                            num += w * diff
+                            den += w
+                        }
+                        y += 2
+                    }
+                    guard den > 0 else { continue }
+                    let score = Double(num) / Double(den) / Double(cols)
+                    if score < bestScore - 0.0001 { bestScore = score; bestD = d; bestWeight = den }
+                }
+            }
+        }
+        if bestWeight < cols * 40 { return .same }   // nothing but blank in the overlap: wait for the next frame
+        if bestScore > 3.5 { return .lost }           // scrolled too far to find the overlap
+        if bestD == 0 { return .same }
+        guard let strip = img.cropping(to: CGRect(x: 0, y: h - bestD, width: width, height: bestD)) else { return .same }
+        strips.append(strip)
+        totalHeight += bestD
+        last = sig
+        return .added(bestD)
+    }
+
+    func image() -> CGImage? {
+        guard let first = strips.first,
+              let ctx = CGContext(data: nil, width: width, height: totalHeight, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: first.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        var y = totalHeight
+        for s in strips {
+            y -= s.height
+            ctx.draw(s, in: CGRect(x: 0, y: y, width: s.width, height: s.height))
+        }
+        return ctx.makeImage()
+    }
+}
+
+/// A dim overlay to drag a rectangle on the screen under the mouse.
+final class RegionPicker: NSView {
+    static var window: NSWindow?
+    var start: NSPoint?
+    var current: NSPoint?
+    var done: ((NSRect?) -> Void)?
+
+    static func pick(hint: String, _ done: @escaping (NSRect?) -> Void) {
+        guard let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main else { done(nil); return }
+        let w = KeyWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        w.level = .screenSaver
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.isReleasedWhenClosed = false
+        let v = RegionPicker(frame: NSRect(origin: .zero, size: screen.frame.size))
+        v.hint = hint
+        v.done = { r in
+            w.orderOut(nil)
+            window = nil
+            done(r.map { $0.offsetBy(dx: screen.frame.minX, dy: screen.frame.minY) })
+        }
+        w.contentView = v
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
+        w.makeFirstResponder(v)
+        window = w
+    }
+
+    var hint = ""
+    var rect: NSRect? {
+        guard let a = start, let b = current else { return nil }
+        return NSRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y))
+    }
+    override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
+
+    override func draw(_ dirty: NSRect) {
+        NSColor.black.withAlphaComponent(0.3).setFill()
+        bounds.fill()
+        if let r = rect {
+            NSColor.clear.setFill()
+            r.fill(using: .copy)
+            claudeOrange.setStroke()
+            let p = NSBezierPath(rect: r.insetBy(dx: -1, dy: -1))
+            p.lineWidth = 2
+            p.stroke()
+        } else {
+            let s = NSAttributedString(string: hint, attributes: [.font: NSFont.systemFont(ofSize: 17, weight: .semibold), .foregroundColor: NSColor.white])
+            let size = s.size()
+            let box = NSRect(x: bounds.midX - size.width / 2 - 18, y: bounds.midY - size.height / 2 - 10, width: size.width + 36, height: size.height + 20)
+            NSColor.black.withAlphaComponent(0.6).setFill()
+            NSBezierPath(roundedRect: box, xRadius: 12, yRadius: 12).fill()
+            s.draw(at: NSPoint(x: box.minX + 18, y: box.minY + 10))
+        }
+    }
+    override func mouseDown(with e: NSEvent) { start = convert(e.locationInWindow, from: nil); current = start; needsDisplay = true }
+    override func mouseDragged(with e: NSEvent) { current = convert(e.locationInWindow, from: nil); needsDisplay = true }
+    override func mouseUp(with e: NSEvent) {
+        if let r = rect, r.width > 60, r.height > 60 { done?(r.integral) } else { done?(nil) }
+    }
+    override func keyDown(with e: NSEvent) { if e.keyCode == UInt16(kVK_Escape) { done?(nil) } }
+}
+
+final class OutlineView: NSView {
+    override func draw(_ dirty: NSRect) {
+        claudeOrange.setStroke()
+        let p = NSBezierPath(rect: bounds.insetBy(dx: 1.5, dy: 1.5))
+        p.lineWidth = 3
+        p.stroke()
+    }
+}
+
+/// Scrolling capture: pick an area, scroll the page yourself, and the frames are joined
+/// into one tall screenshot. Needs the screen recording permission.
+final class ScrollCapture: NSObject {
+    static var current: ScrollCapture?
+    let rect: NSRect   // on screen, Cocoa coordinates
+    let stitcher = Stitcher()
+    var outline: NSWindow?
+    var hud: NSPanel?
+    let label = NSTextField(labelWithString: "Scroll down slowly…")
+    var timer: Timer?
+    var grabbing = false
+    var finished = false
+    let queue = DispatchQueue(label: "claudesniper.scrollcapture")
+
+    static func start() {
+        if let c = current { c.finish(); return }   // the shortcut again = done
+        guard CGPreflightScreenCaptureAccess() else { appDelegate?.explainScreenAccess(); return }
+        let front = NSWorkspace.shared.frontmostApplication
+        RegionPicker.pick(hint: "Drag over the area that scrolls · esc cancels") { r in
+            front?.activate()
+            guard let r else { return }
+            let s = ScrollCapture(rect: r)
+            current = s
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { s.begin() }   // let the overlay disappear first
+        }
+    }
+
+    init(rect: NSRect) { self.rect = rect }
+
+    func begin() {
+        // An outline just outside the area (so it isn't in the pictures) that lets scrolling through.
+        let o = NSWindow(contentRect: rect.insetBy(dx: -4, dy: -4), styleMask: .borderless, backing: .buffered, defer: false)
+        o.level = .floating
+        o.isOpaque = false
+        o.backgroundColor = .clear
+        o.ignoresMouseEvents = true
+        o.isReleasedWhenClosed = false
+        o.contentView = OutlineView(frame: NSRect(origin: .zero, size: o.frame.size))
+        o.orderFrontRegardless()
+        outline = o
+
+        let w: CGFloat = 400, h: CGFloat = 46
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: w, height: h), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = true
+        p.level = .floating
+        p.isReleasedWhenClosed = false
+        p.hidesOnDeactivate = false
+        p.appearance = NSAppearance(named: .darkAqua)
+        let bg = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        bg.wantsLayer = true
+        bg.layer?.backgroundColor = NSColor(srgbRed: 0.13, green: 0.10, blue: 0.10, alpha: 0.96).cgColor
+        bg.layer?.cornerRadius = 12
+        bg.layer?.borderWidth = 1
+        bg.layer?.borderColor = claudeOrange.withAlphaComponent(0.7).cgColor
+        label.font = .systemFont(ofSize: 12.5, weight: .medium)
+        label.textColor = .white
+        label.frame = NSRect(x: 14, y: 14, width: 210, height: 18)
+        label.lineBreakMode = .byTruncatingTail
+        bg.addSubview(label)
+        let doneBtn = NSButton(title: "Done", target: self, action: #selector(finish))
+        doneBtn.bezelStyle = .rounded
+        doneBtn.bezelColor = claudeOrange
+        doneBtn.frame = NSRect(x: 232, y: 8, width: 74, height: 30)
+        let cancelBtn = NSButton(title: "Cancel", target: self, action: #selector(cancel))
+        cancelBtn.bezelStyle = .rounded
+        cancelBtn.frame = NSRect(x: 310, y: 8, width: 80, height: 30)
+        bg.addSubview(doneBtn)
+        bg.addSubview(cancelBtn)
+        p.contentView = bg
+        // Below the area if there's room, otherwise above it.
+        let vf = (NSScreen.screens.first { $0.frame.intersects(rect) } ?? NSScreen.main!).visibleFrame
+        var y = rect.minY - h - 14
+        if y < vf.minY + 6 { y = min(rect.maxY + 14, vf.maxY - h - 6) }
+        p.setFrameOrigin(NSPoint(x: min(max(rect.midX - w / 2, vf.minX + 6), vf.maxX - w - 6), y: y))
+        p.orderFrontRegardless()
+        hud = p
+
+        let t = Timer(timeInterval: 0.22, repeats: true) { [weak self] _ in self?.grab() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        grab()
+    }
+
+    /// One picture of the area, added to the stitched image.
+    func grab() {
+        guard !grabbing, !finished else { return }
+        grabbing = true
+        let r = rect
+        let primaryH = NSScreen.screens.first?.frame.height ?? 0
+        let arg = "\(Int(r.minX)),\(Int(primaryH - r.maxY)),\(Int(r.width)),\(Int(r.height))"   // screencapture counts from the top-left
+        queue.async {
+            let path = NSTemporaryDirectory() + "claudesniper-scroll-\(UUID().uuidString).png"
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            p.arguments = ["-x", "-R", arg, "-t", "png", path]
+            try? p.run()
+            p.waitUntilExit()
+            var result = Stitcher.Result.same
+            if let img = NSImage(contentsOfFile: path)?.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                result = self.stitcher.add(img)
+            }
+            try? FileManager.default.removeItem(atPath: path)
+            let total = self.stitcher.totalHeight
+            DispatchQueue.main.async {
+                self.grabbing = false
+                if self.finished { return }
+                let scale = (NSScreen.screens.first { $0.frame.intersects(r) } ?? NSScreen.main)?.backingScaleFactor ?? 2
+                switch result {
+                case .lost: self.label.stringValue = "Too fast: scroll back a little"; self.label.textColor = Theme.accentSoft
+                default: self.label.stringValue = "Scroll down slowly · \(Int(CGFloat(total) / scale)) pt captured"; self.label.textColor = .white
+                }
+            }
+        }
+    }
+
+    func teardown() {
+        finished = true
+        timer?.invalidate()
+        outline?.orderOut(nil)
+        hud?.orderOut(nil)
+        Self.current = nil
+    }
+
+    @objc func cancel() { teardown() }
+
+    @objc func finish() {
+        guard !finished else { return }
+        teardown()
+        queue.async {   // after any picture still being taken
+            let path = workDir + "/shot-\(Int(Date().timeIntervalSince1970)).png"
+            let ok = self.stitcher.image().map { savePNG($0, to: path) } ?? false
+            DispatchQueue.main.async { if ok { QuickAccess.shared.show(path) } else { Toast.show("Nothing captured") } }
+        }
+    }
+}
+
 // MARK: - Mini Clawd (a tiny floating Clawd instead of the pop-up)
 
 final class MiniView: NSView {
@@ -3338,7 +3969,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
     let startBtn = NSButton(title: "Turn on ClaudeSniper", target: nil, action: nil)
 
     override init() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 560),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 624),
                           styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
         super.init()
         window.title = "Welcome to ClaudeSniper"
@@ -3372,6 +4003,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         let specs: [(String, String, String, Selector)] = [
             ("Claude Code", "The free command-line tool that talks to Claude.", "Install…", #selector(installClaude)),
             ("Signed in to your Claude plan", "Pro or Max. It uses your plan, with no API key.", "Sign in…", #selector(signIn)),
+            ("Screen recording", "So macOS doesn't ask on every capture. Scrolling capture needs it.", "Allow…", #selector(allowScreen)),
             ("Capture", "Press \(hotkeyLabel) and drag over any text. Esc cancels.", "Try a capture", #selector(tryCapture)),
             ("Sample", "Or see a real answer for a sample sentence.", "Try a sample", #selector(trySample)),
         ]
@@ -3481,7 +4113,8 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
     @objc func refresh() {
         let hasClaude = findClaude() != nil
         set(0, hasClaude)
-        for (i, symbol) in [(2, "viewfinder"), (3, "sparkles")] {
+        set(2, appDelegate?.hasScreenAccess == true)
+        for (i, symbol) in [(3, "viewfinder"), (4, "sparkles")] {
             rows[i].icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(paletteColors: [claudeOrange]))
             rows[i].button.isEnabled = false
@@ -3491,8 +4124,8 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         set(1, nil)
         appDelegate?.refreshAuth { [weak self] ok in
             self?.set(1, ok)
-            self?.rows[2].button.isEnabled = ok
             self?.rows[3].button.isEnabled = ok
+            self?.rows[4].button.isEnabled = ok
         }
     }
 
@@ -3510,6 +4143,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
     }
     @objc func signIn() { appDelegate?.login() }
     @objc func tryCapture() { appDelegate?.captureScreen() }
+    @objc func allowScreen() { appDelegate?.askScreenAccess() }
     @objc func trySample() { appDelegate?.trySample() }
     @objc func finish() {
         defaults.set(true, forKey: "onboarded")

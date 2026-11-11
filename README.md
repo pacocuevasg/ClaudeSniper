@@ -44,6 +44,9 @@ Already use [TextSniper](https://textsniper.app)? Its ⌘⇧2 captures are picke
 - **Ask about selected text:** select text in any app, right-click → **Services → Ask ClaudeSniper**. No capture needed. (You can give it a keyboard shortcut in *System Settings → Keyboard → Keyboard Shortcuts → Services*.)
 - **Multi-capture:** press **+** in the pop-up to add another capture to the same question (two pages, a question and its chart).
 - **Capture text only (⌥⌘1):** read the text and copy it without asking Claude, like a plain OCR tool. QR codes and barcodes are read too.
+- **From your iPhone camera:** menu bar → **Import from iPhone or iPad** → take a photo or scan a document. ClaudeSniper reads the text and asks Claude (Continuity Camera).
+- **Screenshots (⌥⌘3):** an area or a window. A thumbnail appears in the corner: copy the image, save it to the Desktop, drag it into any app, copy its text, ask Claude about it, or pin it on screen as a floating reference.
+- **Scrolling capture (⌥⌘4):** drag over a scrolling area, scroll down, press Done. ClaudeSniper stitches the frames into one tall screenshot (a long page, a chat, a document).
 - **Copy table:** a captured table (or a table in Claude's answer) is copied as a real table that pastes into Excel, Numbers, Sheets, Notion or Word. If the on-device reader misses a table, **Extract the table with Claude** in the **⋯** menu gets it from the image.
 - **Have Claude look at the image:** when the text isn't enough (a diagram, a formula, tricky code), send the capture itself from the **⋯** menu.
 - **Live answers:** the text appears while Claude writes it, and the menu bar spark twinkles while Claude is answering.
@@ -88,7 +91,7 @@ Already use [TextSniper](https://textsniper.app)? Its ⌘⇧2 captures are picke
 
 The **⋯** button has the same actions, plus Export chat and History.
 
-Anywhere on your Mac (while ClaudeSniper is on): **⌘⇧1** capture and ask · **⌥⌘1** capture text only · **⌥⌘2** show the last answer.
+Anywhere on your Mac (while ClaudeSniper is on): **⌘⇧1** capture and ask · **⌥⌘1** capture text only · **⌥⌘2** show the last answer · **⌥⌘3** screenshot · **⌥⌘4** scrolling capture.
 
 <div align="center">
 <img src="docs/markdown.png" width="640" alt="An answer with a numbered list, a code block, a table and a quote">
@@ -135,7 +138,10 @@ A **welcome guide** checks that Claude Code is installed, helps you sign in and 
 1. **Sign in to Claude…** opens Terminal with `claude auth login`.
 2. Flip the switch on, pick a model, effort and mode, and press ⌘⇧1 (change it in **Settings → Change capture shortcut**).
 
-The capture uses macOS's own selection (the same as ⌘⇧4), so you pick exactly what ClaudeSniper sees. If macOS asks to let ClaudeSniper record the screen, allow it in *System Settings → Privacy & Security → Screen & System Audio Recording*.
+The capture uses macOS's own selection (the same as ⌘⇧4), so you pick exactly what ClaudeSniper sees. Scrolling capture needs **Screen Recording**: allow it in *System Settings → Privacy & Security → Screen & System Audio Recording* (the welcome guide and the menu have a button for it).
+
+> [!NOTE]
+> Building it yourself? macOS forgets Screen Recording every time an app is re-signed ad hoc, so it asks again after each build. Run `zsh tools/make_signing_cert.sh` once: it makes a local "ClaudeSniper Local" signing certificate that `build.sh` then uses, and the permission sticks.
 
 > [!TIP]
 > To preview the pop-up without using your plan: `open /Applications/ClaudeSniper.app --args --demo` (or `--demo-mini` for Mini Clawd)
