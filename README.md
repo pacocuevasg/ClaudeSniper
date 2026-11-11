@@ -48,6 +48,9 @@ Already use [TextSniper](https://textsniper.app)? Its ⌘⇧2 captures are picke
 - **Screenshots (⌥⌘3):** an area or a window. A thumbnail appears in the corner: copy the image, save it to the Desktop, drag it into any app, copy its text, ask Claude about it, or pin it on screen as a floating reference.
 - **Scrolling capture (⌥⌘4):** drag over a scrolling area, scroll down at a normal pace, press Done. ClaudeSniper stitches the frames into one tall screenshot (a long page, a chat, a document); sticky headers and footers appear only once.
 - **Replace the macOS screenshots:** **Screenshot → Use instead of macOS screenshots** makes ⌘⇧3 (full screen), ⌘⇧4 (area, space for a window) and ⌘⇧5 (a screenshot bar with area, window, full screen, scrolling, copy text and ask Claude) open ClaudeSniper's. ⌃⌘⇧3 / ⌃⌘⇧4 copy instead of saving. Turn off the macOS shortcuts in *System Settings → Keyboard → Keyboard Shortcuts → Screenshots* (ClaudeSniper shows you where).
+
+<img src="docs/screenshots.png" width="720" alt="Screenshot thumbnail with copy, save, ask Claude, copy text and pin, and the screenshot bar">
+
 - **Copy table:** a captured table (or a table in Claude's answer) is copied as a real table that pastes into Excel, Numbers, Sheets, Notion or Word. If the on-device reader misses a table, **Extract the table with Claude** in the **⋯** menu gets it from the image.
 - **Have Claude look at the image:** when the text isn't enough (a diagram, a formula, tricky code), send the capture itself from the **⋯** menu.
 - **Live answers:** the text appears while Claude writes it, and the menu bar spark twinkles while Claude is answering.

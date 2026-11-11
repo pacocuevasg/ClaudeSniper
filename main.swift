@@ -1207,7 +1207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         if let dir = value("--snap-dir") {         // test: save a picture of each window of ours
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + (value("--snap-after").flatMap(Double.init) ?? 2.5)) {
                 func dump(_ v: NSView, _ d: Int) {
                     let t = (v as? NSTextField)?.stringValue ?? (v as? NSButton)?.title ?? ""
                     print(String(repeating: "  ", count: d) + "\(type(of: v)) \(v.frame.integral) hidden=\(v.isHidden) \(t.prefix(40))")
@@ -1220,6 +1220,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: "\(dir)/win\(i).png"))
                 }
                 exit(0)
+            }
+        }
+        if let dir = value("--snap-sc") {          // test: photograph our own windows (needs screen recording)
+            let after = value("--snap-after").flatMap(Double.init) ?? 4
+            DispatchQueue.global().asyncAfter(deadline: .now() + after) {   // off the main thread: menus block it
+                guard #available(macOS 14.0, *) else { exit(1) }
+                SCShareableContent.getExcludingDesktopWindows(true, onScreenWindowsOnly: true) { content, error in
+                    let mine = (content?.windows ?? []).filter { $0.owningApplication?.processID == ProcessInfo.processInfo.processIdentifier && $0.frame.width > 60 && $0.isOnScreen }
+                    if mine.isEmpty { print("snap: no windows \(String(describing: error))"); exit(1) }
+                    let group = DispatchGroup()
+                    for w in mine {
+                        group.enter()
+                        let cfg = SCStreamConfiguration()
+                        let scale = NSScreen.main?.backingScaleFactor ?? 2
+                        cfg.width = Int(w.frame.width * scale); cfg.height = Int(w.frame.height * scale)
+                        cfg.showsCursor = false
+                        cfg.ignoreShadowsSingleWindow = false
+                        cfg.shouldBeOpaque = false
+                        SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: w), configuration: cfg) { img, err in
+                            if let img { _ = savePNG(img, to: "\(dir)/win-\(Int(w.frame.width))x\(Int(w.frame.height))-\(w.windowID).png"); print("snap: \(w.windowID) \(w.frame)") }
+                            else { print("snap error: \(String(describing: err))") }
+                            group.leave()
+                        }
+                    }
+                    group.wait()
+                    exit(0)
+                }
             }
         }
         if a.contains("--demo-bar") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { CaptureBar.toggle() } }
@@ -1295,9 +1322,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// (also --demo-error, --demo-md for the Markdown sample, --demo-thread for a conversation).
     func demo() {
         let a = CommandLine.arguments
-        let q = "What is photosynthesis and why does it matter?"
+        // Test: any question, mode and answer, for screenshots (DEMO_Q, DEMO_MODE, DEMO_ANSWER = a Markdown file).
+        let env = ProcessInfo.processInfo.environment
+        let q = env["DEMO_Q"] ?? "What is photosynthesis and why does it matter?"
         lastCapture = Capture(text: q, imagePath: nil, preview: q)
-        popup.mode = "explain"
+        popup.mode = env["DEMO_MODE"] ?? "explain"
         if a.contains("--demo-error") {
             popup.show(header: header(), preview: q, state: .error("You're not signed in to Claude Code.\nSign in with your Claude account to continue."), footer: "")
             return
@@ -1313,6 +1342,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         popup.show(header: header(), preview: q, state: .loading, footer: "Starting a new chat…")
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
             var text = answer
+            if let f = env["DEMO_ANSWER"], let t = try? String(contentsOfFile: f, encoding: .utf8) { text = t }
             if a.contains("--demo-md") {
                 text = """
                 ## Binary search
