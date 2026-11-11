@@ -41,6 +41,9 @@ Already use [TextSniper](https://textsniper.app)? Its ⌘⇧2 captures are picke
 ### Features
 
 - **Built-in capture and OCR:** no other app needed. The text is read on your Mac in about half a second and also copied to your clipboard. Tables keep their rows and columns (macOS 26+), and a capture with no text is sent to Claude as an image.
+- **Ask about selected text:** select text in any app, right-click → **Services → Ask ClaudeSniper**. No capture needed. (You can give it a keyboard shortcut in *System Settings → Keyboard → Keyboard Shortcuts → Services*.)
+- **Multi-capture:** press **+** in the pop-up to add another capture to the same question (two pages, a question and its chart).
+- **Capture text only (⌥⌘1):** read the text and copy it without asking Claude, like a plain OCR tool. QR codes and barcodes are read too.
 - **Copy table:** a captured table (or a table in Claude's answer) is copied as a real table that pastes into Excel, Numbers, Sheets, Notion or Word. If the on-device reader misses a table, **Extract the table with Claude** in the **⋯** menu gets it from the image.
 - **Have Claude look at the image:** when the text isn't enough (a diagram, a formula, tricky code), send the capture itself from the **⋯** menu.
 - **Live answers:** the text appears while Claude writes it, and the menu bar spark twinkles while Claude is answering.
@@ -59,7 +62,7 @@ Already use [TextSniper](https://textsniper.app)? Its ⌘⇧2 captures are picke
 - **Pin the pop-up:** the pin button (⌘P) keeps it open (no auto-close, esc doesn't close it) while you work next to it.
 - **Mini Clawd mode:** instead of the pop-up, a tiny Clawd walks while Claude thinks and hops with a **!** when the answer is ready. Click it to open the answer, drag it anywhere, right-click to hide it (Settings → Mini Clawd).
 - **Answer language:** match your Mac, or English, Español, Português, Français or Deutsch.
-- **Settings:** answer length, pop-up position, auto-close, auto-copy, a sound when the answer arrives, Mini Clawd mode, a custom capture shortcut, open at login.
+- **Settings:** keep or join line breaks in captured text, answer length, pop-up position, auto-close, auto-copy, a sound when the answer arrives, Mini Clawd mode, a custom capture shortcut, open at login.
 - **Images:** if the clipboard holds an image, Claude analyzes it.
 - **Pixel-art Clawd** walks while Claude thinks.
 
@@ -73,6 +76,7 @@ Already use [TextSniper](https://textsniper.app)? Its ⌘⇧2 captures are picke
 |---|---|
 | **1–6** (7–9 for your modes) | Re-run the same capture in another mode |
 | **Tab** | Ask a follow-up in the same chat |
+| **+** | Add another capture to this question |
 | **⌘C** | Copy the answer (or just the selected text) |
 | **⌘↩** | Replace: paste the result where you captured it (Fix and Translate) |
 | **⇧⌘C** | Copy table: the captured table, or the table in the answer |
@@ -83,6 +87,8 @@ Already use [TextSniper](https://textsniper.app)? Its ⌘⇧2 captures are picke
 | **Esc** | Close |
 
 The **⋯** button has the same actions, plus Export chat and History.
+
+Anywhere on your Mac (while ClaudeSniper is on): **⌘⇧1** capture and ask · **⌥⌘1** capture text only · **⌥⌘2** show the last answer.
 
 <div align="center">
 <img src="docs/markdown.png" width="640" alt="An answer with a numbered list, a code block, a table and a quote">

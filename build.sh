@@ -37,6 +37,13 @@ cat > "$BUILD/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSServices</key>
+  <array><dict>
+    <key>NSMenuItem</key><dict><key>default</key><string>Ask ClaudeSniper</string></dict>
+    <key>NSMessage</key><string>askSelection</string>
+    <key>NSPortName</key><string>ClaudeSniper</string>
+    <key>NSSendTypes</key><array><string>NSStringPboardType</string><string>public.utf8-plain-text</string></array>
+  </dict></array>
   <key>NSAppleEventsUsageDescription</key><string>ClaudeSniper exports a chat to Apple Notes when you ask it to.</string>
 </dict></plist>
 PLIST

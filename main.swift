@@ -113,6 +113,8 @@ enum Settings {
     static var miniMode: Bool { defaults.bool(forKey: "miniMode") }
     /// Also put the captured text on the clipboard, like an OCR tool.
     static var copyCapture: Bool { defaults.object(forKey: "copyCapture") as? Bool ?? true }
+    /// Off: the lines of a paragraph are joined into one (handy for PDFs).
+    static var keepLineBreaks: Bool { defaults.object(forKey: "keepLineBreaks") as? Bool ?? true }
 }
 let chatMemoryOptions: [(Any, String)] = [(0, "Off · every capture is a new chat"), (5, "5 minutes"), (10, "10 minutes"),
                                           (15, "15 minutes"), (30, "30 minutes"), (60, "1 hour")]
@@ -466,6 +468,57 @@ enum Markdown {
             }
         }
         return out
+    }
+}
+
+/// Joins the lines of each paragraph into one line (blank lines still separate paragraphs).
+func joinLines(_ t: String) -> String {
+    var out = ""
+    for line in t.components(separatedBy: "\n") {
+        let l = line.trimmingCharacters(in: .whitespaces)
+        if l.isEmpty { if !out.hasSuffix("\n\n") { out += "\n\n" }; continue }
+        if out.isEmpty || out.hasSuffix("\n") { out += l }
+        else if out.hasSuffix("-"), l.first?.isLowercase == true { out.removeLast(); out += l }   // a word split across lines
+        else { out += " " + l }
+    }
+    return out.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// A small message next to the cursor that fades out by itself.
+enum Toast {
+    static var panel: NSPanel?
+    static func show(_ text: String) {
+        panel?.orderOut(nil)
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 13, weight: .semibold)
+        label.textColor = .white
+        let size = label.fittingSize
+        let w = size.width + 36, h: CGFloat = 36
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: w, height: h), styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = true
+        p.level = .floating
+        p.ignoresMouseEvents = true
+        p.isReleasedWhenClosed = false
+        let v = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        v.wantsLayer = true
+        v.layer?.backgroundColor = NSColor(srgbRed: 0.13, green: 0.10, blue: 0.10, alpha: 0.96).cgColor
+        v.layer?.cornerRadius = 18
+        v.layer?.borderWidth = 1
+        v.layer?.borderColor = claudeOrange.withAlphaComponent(0.7).cgColor
+        label.frame = NSRect(x: 18, y: (h - size.height) / 2, width: size.width, height: size.height)
+        v.addSubview(label)
+        p.contentView = v
+        let m = NSEvent.mouseLocation
+        p.setFrameOrigin(NSPoint(x: m.x + 14, y: m.y - h - 14))
+        p.orderFrontRegardless()
+        panel = p
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak p] in
+            guard let p, panel === p else { return }
+            NSAnimationContext.runAnimationGroup({ $0.duration = 0.25; p.animator().alphaValue = 0 }, completionHandler: { p.orderOut(nil) })
+        }
     }
 }
 
@@ -865,7 +918,7 @@ final class WarmProcess {
 // MARK: - Global shortcuts (no permission needed): capture, and ⌥⌘2 for the last answer
 
 var hotKeyRefs: [UInt32: EventHotKeyRef] = [:]
-let hotKeyShowLast: UInt32 = 1, hotKeyCapture: UInt32 = 2
+let hotKeyShowLast: UInt32 = 1, hotKeyCapture: UInt32 = 2, hotKeyTextOnly: UInt32 = 3
 
 func installHotkeyHandler() {
     var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
@@ -876,6 +929,7 @@ func installHotkeyHandler() {
         let id = hk.id
         DispatchQueue.main.async {
             if id == hotKeyShowLast { appDelegate?.showLast() } else if id == hotKeyCapture { appDelegate?.captureScreen() }
+            else if id == hotKeyTextOnly { appDelegate?.captureTextOnly() }
         }
         return noErr
     }, 1, &spec, nil, nil)
@@ -905,8 +959,16 @@ func recognizeText(at path: String) -> (text: String, forClaude: String, tables:
     req.recognitionLevel = .accurate
     req.usesLanguageCorrection = true
     req.automaticallyDetectsLanguage = true
-    try? VNImageRequestHandler(cgImage: img).perform([req])
+    let codeReq = VNDetectBarcodesRequest()
+    try? VNImageRequestHandler(cgImage: img).perform([req, codeReq])
     let classic = (req.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+    // QR codes and barcodes: their content counts as captured text.
+    let codes = Array(Set((codeReq.results ?? []).compactMap { $0.payloadStringValue })).sorted()
+    if !codes.isEmpty {
+        let c = codes.joined(separator: "\n")
+        let seen = classic.isEmpty ? "" : classic + "\n\n"
+        return (classic.isEmpty ? c : classic + "\n" + c, seen + "QR code / barcode content:\n" + c, [])
+    }
 
     // Table detection needs the macOS 26 SDK (Xcode 26, Swift 6.2) to build, and macOS 26 to run.
     #if compiler(>=6.2)
@@ -1036,7 +1098,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set {
             defaults.set(newValue, forKey: "enabled"); updateIcon()
             if newValue { startMonitoring(); prewarm(); registerCaptureHotkey() }
-            else { stopMonitoring(); stopWarm(); setHotkey(hotKeyCapture, code: nil) }
+            else { stopMonitoring(); stopWarm(); setHotkey(hotKeyCapture, code: nil); setHotkey(hotKeyTextOnly, code: nil) }
         }
     }
     var model: String { defaults.string(forKey: "model") ?? "haiku" }
@@ -1044,7 +1106,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var defaultMode: String { defaults.string(forKey: "mode") ?? "auto" }
     var answerLanguage: String { defaults.string(forKey: "answerLanguage") ?? "system" }
 
-    struct Capture { let text: String?; let imagePath: String?; let preview: String; var tables: [Table] = [] }
+    struct Capture {
+        let text: String?; let imagePath: String?; let preview: String
+        var tables: [Table] = []
+        var parts = 1   // multi-capture: how many pieces this question has
+    }
     var lastCapture: Capture?
 
     func applicationWillTerminate(_ n: Notification) { stopWarm() }
@@ -1084,6 +1150,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateIcon()
         if enabled { startMonitoring() }
         refreshAuth()
+        NSApp.servicesProvider = self   // "Ask ClaudeSniper" in the Services menu
+        NSUpdateDynamicServices()
         installHotkeyHandler()
         setHotkey(hotKeyShowLast, code: Int(kVK_ANSI_2), mods: [.command, .option])
         if enabled { registerCaptureHotkey() }
@@ -1130,7 +1198,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let copy = workDir + "/capture-test-\(Int(Date().timeIntervalSince1970)).png"
                 try? FileManager.default.copyItem(atPath: file, toPath: copy)
                 let r = recognizeText(at: copy)
-                DispatchQueue.main.async { self.captured(r, imagePath: copy) }
+                DispatchQueue.main.async { self.captured(r, imagePath: copy, kind: a.contains("--text-only") ? .textOnly : .ask) }
+                if let more = value("--add-file"), let secs = value("--add-after").flatMap(Double.init) {   // test: multi-capture
+                    Thread.sleep(forTimeInterval: secs)
+                    let copy2 = workDir + "/capture-test2-\(Int(Date().timeIntervalSince1970)).png"
+                    try? FileManager.default.copyItem(atPath: more, toPath: copy2)
+                    let r2 = recognizeText(at: copy2)
+                    DispatchQueue.main.async { self.captured(r2, imagePath: copy2, kind: .add) }
+                }
             }
         }
         if a.contains("--interpret-clipboard") {
@@ -1345,6 +1420,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let cap = item("Capture and ask Claude", "viewfinder", #selector(captureScreen))
         cap.toolTip = "Drag over part of the screen (\(hotkeyLabel) when ClaudeSniper is on). Esc cancels."
         menu.addItem(cap)
+        let only = item("Capture text only", "text.viewfinder", #selector(captureTextOnly))
+        only.keyEquivalent = "1"
+        only.keyEquivalentModifierMask = [.option, .command]
+        only.toolTip = "Read the text and copy it, without asking Claude."
+        menu.addItem(only)
         menu.addItem(item("Interpret clipboard now", "wand.and.stars", #selector(testNow)))
         menu.addItem(settingsItem())
         menu.addItem(.separator())
@@ -1684,6 +1764,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let cc = item("Copy captured text to the clipboard", "text.viewfinder", #selector(toggleCopyCapture))
         cc.state = Settings.copyCapture ? .on : .off
         m.addItem(cc)
+        let kb = item("Keep line breaks in captured text", "text.alignleft", #selector(toggleLineBreaks))
+        kb.state = Settings.keepLineBreaks ? .on : .off
+        m.addItem(kb)
         m.addItem(toggle("Copy the answer automatically", "doc.on.clipboard", key: "autoCopy"))
         m.addItem(toggle("Play a sound when the answer arrives", "speaker.wave.2", key: "sound"))
         m.addItem(toggle("Mini Clawd: answers wait in a tiny Clawd", "face.smiling", key: "miniMode"))
@@ -1712,6 +1795,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func togglePicked(_ i: NSMenuItem) { if let k = i.representedObject as? String { defaults.set(!defaults.bool(forKey: k), forKey: k) } }
     @objc func clearChats() { store.clearAll() }
     @objc func toggleCopyCapture() { defaults.set(!Settings.copyCapture, forKey: "copyCapture") }
+    @objc func toggleLineBreaks() { defaults.set(!Settings.keepLineBreaks, forKey: "keepLineBreaks") }
     @objc func allowAutoPaste() {
         _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
     }
@@ -1767,6 +1851,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func registerCaptureHotkey() {
         setHotkey(hotKeyCapture, code: hotkeyCode, mods: NSEvent.ModifierFlags(rawValue: hotkeyMods))
+        setHotkey(hotKeyTextOnly, code: Int(kVK_ANSI_1), mods: [.command, .option])   // ⌥⌘1: copy the text only
     }
 
     func endRecording() {
@@ -1920,46 +2005,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Capturing the screen
 
+    /// What to do with a capture: ask Claude, only copy its text, or add it to the current question.
+    enum CaptureKind { case ask, textOnly, add }
     var capturing = false
 
-    /// Lets you drag over part of the screen (the system's own selection, like ⌘⇧4),
-    /// reads the text on this Mac and asks Claude. Esc cancels.
-    @objc func captureScreen() {
+    @objc func captureScreen() { startCapture(.ask) }
+    /// Like an OCR tool: read the text and copy it, without asking Claude.
+    @objc func captureTextOnly() { startCapture(.textOnly) }
+    /// Multi-capture: one question about several pieces (two pages, a question and its chart).
+    @objc func addCapture() {
+        guard lastCapture?.text != nil else { NSSound.beep(); return }
+        popup.panel.orderOut(nil)   // out of the way while you select
+        startCapture(.add)
+    }
+
+    /// Lets you drag over part of the screen (the system's own selection, like ⌘⇧4)
+    /// and reads the text on this Mac. Esc cancels.
+    func startCapture(_ kind: CaptureKind) {
         guard !capturing else { return }
         capturing = true
         lastActivity = Date()
-        prewarm()   // Fast: get a process ready while you select
+        if kind != .textOnly { prewarm() }   // Fast: get a process ready while you select
         let path = workDir + "/capture-\(Int(Date().timeIntervalSince1970)).png"
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
         p.arguments = ["-i", "-x", "-t", "png", path]
         p.terminationHandler = { [weak self] _ in
             let exists = FileManager.default.fileExists(atPath: path)
-            if exists { DispatchQueue.main.async { self?.setBusy(true) } }
+            if exists && kind != .textOnly { DispatchQueue.main.async { self?.setBusy(true) } }
             let r = exists ? recognizeText(at: path) : ("", "", [])
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.capturing = false
-                if exists { self.captured(r, imagePath: path) }   // no file: you pressed esc
+                if exists { self.captured(r, imagePath: path, kind: kind) }   // no file: you pressed esc
             }
         }
         do { try p.run() } catch { capturing = false; NSSound.beep() }
     }
 
+    func copyCaptured(_ t: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(t, forType: .string)
+        lastChange = NSPasteboard.general.changeCount   // our own copy isn't a new capture
+    }
+
     /// A capture was read: text goes to Claude as text; a capture with no text goes as an image.
-    func captured(_ r: (text: String, forClaude: String, tables: [Table]), imagePath: String) {
-        let t = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    func captured(_ r: (text: String, forClaude: String, tables: [Table]), imagePath: String, kind: CaptureKind = .ask) {
+        var t = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var forClaude = r.forClaude.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !Settings.keepLineBreaks && r.tables.isEmpty {
+            if forClaude == t { forClaude = joinLines(t) }
+            t = joinLines(t)
+        }
+
+        if kind == .textOnly {
+            try? FileManager.default.removeItem(atPath: imagePath)
+            if t.isEmpty { Toast.show("No text found") } else {
+                copyCaptured(t)
+                let words = t.split { $0 == " " || $0 == "\n" }.count
+                Toast.show("Copied · \(words) word\(words == 1 ? "" : "s")")
+            }
+            return
+        }
+        if kind == .add, let prev = lastCapture, let prevText = prev.text, !t.isEmpty {
+            let n = prev.parts + 1
+            let text = (prev.parts == 1 ? "[Part 1]\n" + prevText : prevText) + "\n\n[Part \(n)]\n" + forClaude
+            let plain = prev.preview + "\n\n" + t
+            lastCapture = Capture(text: text, imagePath: imagePath, preview: plain, tables: prev.tables + r.tables, parts: n)
+            if Settings.copyCapture { copyCaptured(plain) }
+            run(lastCapture!, modeID: popup.mode, again: false)
+            return
+        }
         if t.isEmpty {
             lastCapture = Capture(text: nil, imagePath: imagePath, preview: "🖼  Captured image")
         } else {
-            lastCapture = Capture(text: r.forClaude.trimmingCharacters(in: .whitespacesAndNewlines), imagePath: imagePath, preview: t, tables: r.tables)
-            if Settings.copyCapture {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(t, forType: .string)
-                lastChange = NSPasteboard.general.changeCount   // our own copy isn't a new capture
-            }
+            lastCapture = Capture(text: forClaude, imagePath: imagePath, preview: t, tables: r.tables)
+            if Settings.copyCapture { copyCaptured(t) }
         }
         run(lastCapture!, modeID: testMode ?? defaultMode, again: false)
+    }
+
+    /// Right-click selected text in any app → Services → "Ask ClaudeSniper".
+    @objc func askSelection(_ pboard: NSPasteboard, userData: String, error: AutoreleasingUnsafeMutablePointer<NSString>) {
+        guard let t = pboard.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty else { return }
+        lastCapture = Capture(text: t, imagePath: nil, preview: t)
+        run(lastCapture!, modeID: defaultMode, again: false)
     }
 
     /// The text reader missed something (a diagram, a formula, tricky code): let Claude see the image.
@@ -2005,7 +2135,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var m = mode(modeID)
         if let task { m = Mode(id: m.id, label: task.label, symbol: m.symbol, instruction: task.instruction) }
         popup.captureTables = c.tables
-        let head = again ? (c.text == nil && c.imagePath != nil ? "Same capture as before; this time look at the image itself." : "Same capture as before, now in another mode.") : "New capture."
+        let fresh = c.parts > 1 ? "New capture in \(c.parts) parts: answer about all of them together." : "New capture."
+        let head = again ? (c.text == nil && c.imagePath != nil ? "Same capture as before; this time look at the image itself." : "Same capture as before, now in another mode.") : fresh
         let body: String
         if let t = c.text {
             body = "\(head)\nMODE: \(m.label) — \(m.instruction)\n\nCapture:\n\n\(t)"
@@ -2510,6 +2641,7 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         let ch = e.charactersIgnoringModifiers?.lowercased() ?? ""
         if mods.isEmpty {
             if e.keyCode == UInt16(kVK_Tab) { if done { showAsk() }; return true }
+            if ch == "+" || ch == "=" { appDelegate?.addCapture(); return true }
             let modes = allModes()
             if let n = Int(ch), (1...modes.count).contains(n) { appDelegate?.rerun(modeID: modes[n - 1].id); return true }
             return false
@@ -2649,6 +2781,7 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         add(speech.isSpeaking ? "Stop reading" : "Read aloud", "speaker.wave.2", #selector(speak), key: "r", enabled: done)
         add("Show the whole conversation", "rectangle.stack", #selector(toggleThread), key: "t", on: showThread, enabled: done && thread.count > 1)
         add("Keep open (pin)", "pin", #selector(togglePin), key: "p", on: pinned)
+        add("Add another capture to this question", "plus.viewfinder", #selector(AppDelegate.addCapture), key: "+", enabled: appDelegate?.lastCapture?.text != nil, target: appDelegate)
         add("Have Claude look at the image", "photo", #selector(AppDelegate.rerunWithImage), enabled: appDelegate?.canSendImage == true, target: appDelegate)
         add("Extract the table with Claude", "tablecells", #selector(AppDelegate.extractTable), enabled: appDelegate?.canExtractTable == true, target: appDelegate)
         m.addItem(.separator())
@@ -2667,7 +2800,7 @@ final class PopupController: NSObject, AVSpeechSynthesizerDelegate {
         m.addItem(export)
         add("History…", "clock.arrow.circlepath", #selector(AppDelegate.openHistory), target: appDelegate)
         m.addItem(.separator())
-        let hint = NSMenuItem(title: "1–6 switch mode  ·  Tab ask  ·  Esc close", action: nil, keyEquivalent: "")
+        let hint = NSMenuItem(title: "1–6 switch mode  ·  + add capture  ·  Tab ask  ·  Esc close", action: nil, keyEquivalent: "")
         hint.isEnabled = false
         m.addItem(hint)
         m.popUp(positioning: nil, at: NSPoint(x: b.bounds.width - 240, y: b.bounds.height + 6), in: b)
