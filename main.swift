@@ -17,6 +17,9 @@ import AVFoundation
 import NaturalLanguage
 import UniformTypeIdentifiers
 import Vision
+import ScreenCaptureKit
+import CoreMedia
+import VideoToolbox
 
 let defaults = UserDefaults.standard
 let isDemo = CommandLine.arguments.contains { $0.hasPrefix("--demo") }
@@ -115,6 +118,8 @@ enum Settings {
     static var copyCapture: Bool { defaults.object(forKey: "copyCapture") as? Bool ?? true }
     /// Off: the lines of a paragraph are joined into one (handy for PDFs).
     static var keepLineBreaks: Bool { defaults.object(forKey: "keepLineBreaks") as? Bool ?? true }
+    /// ⌘⇧3, ⌘⇧4 and ⌘⇧5 open ClaudeSniper's screenshots instead of macOS's.
+    static var replaceSystemShots: Bool { defaults.bool(forKey: "replaceSystemShots") }
 }
 let chatMemoryOptions: [(Any, String)] = [(0, "Off · every capture is a new chat"), (5, "5 minutes"), (10, "10 minutes"),
                                           (15, "15 minutes"), (30, "30 minutes"), (60, "1 hour")]
@@ -919,6 +924,8 @@ final class WarmProcess {
 
 var hotKeyRefs: [UInt32: EventHotKeyRef] = [:]
 let hotKeyShowLast: UInt32 = 1, hotKeyCapture: UInt32 = 2, hotKeyTextOnly: UInt32 = 3, hotKeyShot: UInt32 = 4, hotKeyScroll: UInt32 = 5
+let hotKeySysFull: UInt32 = 6, hotKeySysArea: UInt32 = 7, hotKeySysBar: UInt32 = 8, hotKeySysFullCopy: UInt32 = 9, hotKeySysAreaCopy: UInt32 = 10
+let systemShotHotkeys = [hotKeySysFull, hotKeySysArea, hotKeySysBar, hotKeySysFullCopy, hotKeySysAreaCopy]
 
 func installHotkeyHandler() {
     var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
@@ -932,6 +939,11 @@ func installHotkeyHandler() {
             else if id == hotKeyTextOnly { appDelegate?.captureTextOnly() }
             else if id == hotKeyShot { appDelegate?.takeScreenshot() }
             else if id == hotKeyScroll { appDelegate?.scrollingCapture() }
+            else if id == hotKeySysFull { appDelegate?.takeFullScreenShot() }
+            else if id == hotKeySysArea { appDelegate?.takeScreenshot() }
+            else if id == hotKeySysBar { CaptureBar.toggle() }
+            else if id == hotKeySysFullCopy { appDelegate?.shoot(["-D", appDelegate?.mouseDisplay ?? "1"], toClipboard: true) }
+            else if id == hotKeySysAreaCopy { appDelegate?.shoot(["-i"], toClipboard: true) }
         }
         return noErr
     }, 1, &spec, nil, nil)
@@ -1100,7 +1112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set {
             defaults.set(newValue, forKey: "enabled"); updateIcon()
             if newValue { startMonitoring(); prewarm(); registerCaptureHotkey() }
-            else { stopMonitoring(); stopWarm(); for id in [hotKeyCapture, hotKeyTextOnly, hotKeyShot, hotKeyScroll] { setHotkey(id, code: nil) } }
+            else { stopMonitoring(); stopWarm(); for id in [hotKeyCapture, hotKeyTextOnly, hotKeyShot, hotKeyScroll] + systemShotHotkeys { setHotkey(id, code: nil) } }
         }
     }
     var model: String { defaults.string(forKey: "model") ?? "haiku" }
@@ -1188,6 +1200,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if a.contains("--demo-busy") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.setBusy(true) } }
         if a.contains("--demo-pin") { DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.popup.togglePin() } }
         if a.contains("--demo-history") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.openHistory() } }
+        if a.contains("--demo-phone") {           // the iPhone window, and its Continuity Camera menu
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                PhoneImport.shared.show()
+                if a.contains("--demo-phone-menu") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { PhoneImport.shared.choose() } }
+            }
+        }
+        if let dir = value("--snap-dir") {         // test: save a picture of each window of ours
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                func dump(_ v: NSView, _ d: Int) {
+                    let t = (v as? NSTextField)?.stringValue ?? (v as? NSButton)?.title ?? ""
+                    print(String(repeating: "  ", count: d) + "\(type(of: v)) \(v.frame.integral) hidden=\(v.isHidden) \(t.prefix(40))")
+                    v.subviews.forEach { dump($0, d + 1) }
+                }
+                if a.contains("--dump") { for w in NSApp.windows where w.isVisible { if let v = w.contentView { dump(v, 0) } } }
+                for (i, w) in NSApp.windows.enumerated() where w.isVisible {
+                    guard let v = w.contentView, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { continue }
+                    v.cacheDisplay(in: v.bounds, to: rep)
+                    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: "\(dir)/win\(i).png"))
+                }
+                exit(0)
+            }
+        }
+        if a.contains("--demo-bar") { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { CaptureBar.toggle() } }
         if let img = value("--demo-shot") {      // the thumbnail overlay for an image file
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                 QuickAccess.shared.show(img)
@@ -1201,7 +1236,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             var y = 0, log = [String]()
             for stepBy in [0, 137, 262, 90, 410, 333, 58, 480, 205, 377, 512, 144, 290, 466, 121, 350, 600, 0, 75, 230] {
                 y = min(y + stepBy, img.height - h)
-                if let f = img.cropping(to: CGRect(x: 0, y: y, width: img.width, height: h)) { log.append("\(st.add(f))") }
+                guard var f = img.cropping(to: CGRect(x: 0, y: y, width: img.width, height: h)) else { continue }
+                if a.contains("--stitch-sticky"), let ctx = CGContext(data: nil, width: f.width, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                                                     space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                    ctx.draw(f, in: CGRect(x: 0, y: 0, width: f.width, height: h))
+                    ctx.setFillColor(CGColor(red: 0.85, green: 0.45, blue: 0.3, alpha: 1)); ctx.fill(CGRect(x: 0, y: h - 70, width: f.width, height: 70))   // header
+                    ctx.setFillColor(CGColor(red: 0.2, green: 0.3, blue: 0.6, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: f.width, height: 60))        // footer
+                    if log.count % 2 == 1 { ctx.setFillColor(CGColor(gray: 0.3, alpha: 0.8)); ctx.fill(CGRect(x: f.width - 14, y: 200, width: 9, height: 260)) }   // scroll bar
+                    if let m = ctx.makeImage() { f = m }
+                }
+                log.append("\(st.add(f))")
             }
             let ok = st.image().map { savePNG($0, to: out) } ?? false
             print("stitched height \(st.totalHeight), expected \(y + h), saved \(ok): \(log.joined(separator: " "))")
@@ -1449,10 +1493,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         only.keyEquivalentModifierMask = [.option, .command]
         only.toolTip = "Read the text and copy it, without asking Claude."
         menu.addItem(only)
-        let phone = item("Import from iPhone or iPad", "iphone", nil)
-        phone.identifier = NSMenuItem.importFromDeviceIdentifier   // macOS adds "Take Photo" and "Scan Documents"
-        phone.submenu = NSMenu()
-        menu.addItem(phone)
+        menu.addItem(item("Import from iPhone or iPad…", "iphone", #selector(importFromPhone)))
         let shotItem = item("Screenshot", "camera.viewfinder", nil)
         let sm = NSMenu()
         let area = item("Area", "rectangle.dashed", #selector(takeScreenshot))
@@ -1460,11 +1501,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         area.keyEquivalentModifierMask = [.option, .command]
         sm.addItem(area)
         sm.addItem(item("Window", "macwindow", #selector(takeWindowShot)))
+        let full = item("Full screen", "display", #selector(takeFullScreenShot))
+        let bar = item("Screenshot bar", "menubar.rectangle", #selector(showCaptureBar))
+        if Settings.replaceSystemShots {
+            area.keyEquivalent = "4"; area.keyEquivalentModifierMask = [.shift, .command]
+            full.keyEquivalent = "3"; full.keyEquivalentModifierMask = [.shift, .command]
+            bar.keyEquivalent = "5"; bar.keyEquivalentModifierMask = [.shift, .command]
+        }
+        sm.addItem(full)
         let scrollItem = item("Scrolling capture", "arrow.up.and.down.text.horizontal", #selector(scrollingCapture))
         scrollItem.keyEquivalent = "4"
         scrollItem.keyEquivalentModifierMask = [.option, .command]
         scrollItem.toolTip = "Pick an area, scroll the page, and get one tall screenshot."
         sm.addItem(scrollItem)
+        sm.addItem(bar)
+        sm.addItem(.separator())
+        let rs = item("Use instead of macOS screenshots (⌘⇧3 ⌘⇧4 ⌘⇧5)", "camera.on.rectangle", #selector(toggleReplaceShots))
+        rs.state = Settings.replaceSystemShots ? .on : .off
+        sm.addItem(rs)
+        if Settings.replaceSystemShots && systemShotsOn {
+            sm.addItem(status(false, "Turn off the macOS shortcuts…", action: #selector(explainSystemShots)))
+        }
         shotItem.submenu = sm
         menu.addItem(shotItem)
         menu.addItem(item("Interpret clipboard now", "wand.and.stars", #selector(testNow)))
@@ -1896,6 +1953,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setHotkey(hotKeyTextOnly, code: Int(kVK_ANSI_1), mods: [.command, .option])   // ⌥⌘1: copy the text only
         setHotkey(hotKeyShot, code: Int(kVK_ANSI_3), mods: [.command, .option])       // ⌥⌘3: screenshot
         setHotkey(hotKeyScroll, code: Int(kVK_ANSI_4), mods: [.command, .option])     // ⌥⌘4: scrolling capture
+        // Instead of macOS's screenshots (it keeps them until they're turned off in System Settings).
+        let sys = Settings.replaceSystemShots
+        setHotkey(hotKeySysFull, code: sys ? Int(kVK_ANSI_3) : nil, mods: [.command, .shift])
+        setHotkey(hotKeySysArea, code: sys ? Int(kVK_ANSI_4) : nil, mods: [.command, .shift])
+        setHotkey(hotKeySysBar, code: sys ? Int(kVK_ANSI_5) : nil, mods: [.command, .shift])
+        setHotkey(hotKeySysFullCopy, code: sys ? Int(kVK_ANSI_3) : nil, mods: [.command, .shift, .control])
+        setHotkey(hotKeySysAreaCopy, code: sys ? Int(kVK_ANSI_4) : nil, mods: [.command, .shift, .control])
     }
 
     func endRecording() {
@@ -2072,9 +2136,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func takeScreenshot() { shoot(["-i"]) }
     @objc func takeWindowShot() { shoot(["-i", "-W"]) }
     @objc func scrollingCapture() { ScrollCapture.start() }
+    @objc func takeFullScreenShot() { shoot(["-D", mouseDisplay]) }
+    @objc func showCaptureBar() { CaptureBar.toggle() }
 
-    /// A plain screenshot: the system's selection, then the thumbnail overlay.
-    func shoot(_ flags: [String]) {
+    /// screencapture's number for the display under the mouse (1 = main).
+    var mouseDisplay: String {
+        let i = NSScreen.screens.firstIndex { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? 0
+        return "\(i + 1)"
+    }
+
+    /// True while any of macOS's own screenshot shortcuts is still on (it then gets them first).
+    var systemShotsOn: Bool {
+        let all = CFPreferencesCopyAppValue("AppleSymbolicHotKeys" as CFString, "com.apple.symbolichotkeys" as CFString) as? [String: Any] ?? [:]
+        // 28/29: ⌘⇧3 (save/copy), 30/31: ⌘⇧4, 184: ⌘⇧5. Missing = on (the default).
+        return ["28", "29", "30", "31", "184"].contains { ((all[$0] as? [String: Any])?["enabled"] as? Bool) ?? true }
+    }
+
+    @objc func toggleReplaceShots() {
+        let on = !Settings.replaceSystemShots
+        defaults.set(on, forKey: "replaceSystemShots")
+        if enabled { registerCaptureHotkey() }
+        if on && systemShotsOn { explainSystemShots() }
+    }
+
+    @objc func explainSystemShots() {
+        let a = NSAlert()
+        a.messageText = "Turn off the macOS screenshot shortcuts"
+        a.informativeText = "macOS keeps ⌘⇧3, ⌘⇧4 and ⌘⇧5 for itself while its own shortcuts are on.\n\nIn System Settings → Keyboard → Keyboard Shortcuts… → Screenshots, uncheck them. ClaudeSniper takes over right away:\n\n⌘⇧3  full screen\n⌘⇧4  area (press space for a window)\n⌘⇧5  screenshot bar\n⌃⌘⇧3 / ⌃⌘⇧4  copy instead of save"
+        a.addButton(withTitle: "Open Keyboard Settings")
+        a.addButton(withTitle: "Later")
+        NSApp.activate(ignoringOtherApps: true)
+        if a.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Keyboard-Settings.extension")!)
+        }
+    }
+
+    /// A plain screenshot: the system's selection, then the thumbnail overlay (or just copied).
+    func shoot(_ flags: [String], toClipboard: Bool = false) {
         guard !capturing else { return }
         capturing = true
         let path = workDir + "/shot-\(Int(Date().timeIntervalSince1970)).png"
@@ -2084,7 +2182,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         p.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
                 self?.capturing = false
-                if FileManager.default.fileExists(atPath: path) { QuickAccess.shared.show(path) }
+                guard FileManager.default.fileExists(atPath: path) else { return }
+                if toClipboard, let img = NSImage(contentsOfFile: path) {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.writeObjects([img])
+                    Toast.show("Screenshot copied")
+                } else { QuickAccess.shared.show(path) }
             }
         }
         do { try p.run() } catch { capturing = false; NSSound.beep() }
@@ -2103,21 +2206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Import from iPhone or iPad (Continuity Camera)
 
-    /// macOS fills the "Import from iPhone or iPad" menu when something accepts an image.
-    @objc func validRequestor(forSendType sendType: NSPasteboard.PasteboardType?, returnType: NSPasteboard.PasteboardType?) -> Any? {
-        if let t = returnType, NSImage.imageTypes.contains(t.rawValue) { return self }
-        return nil
-    }
-
-    /// The photo or scan taken with the phone arrives here.
-    @objc func readSelection(from pboard: NSPasteboard) -> Bool {
-        guard let img = NSImage(pasteboard: pboard), let tiff = img.tiffRepresentation,
-              let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else { return false }
-        let tmp = NSTemporaryDirectory() + "claudesniper-phone-\(UUID().uuidString).png"
-        guard (try? png.write(to: URL(fileURLWithPath: tmp))) != nil else { return false }
-        readImage(at: tmp, kind: .ask)
-        return true
-    }
+    @objc func importFromPhone() { PhoneImport.shared.show() }
 
     // MARK: Capturing the screen
 
@@ -3531,8 +3620,11 @@ enum PinnedShot {
 /// only the new rows at the bottom are added.
 final class Stitcher {
     static let cols = 48
-    private(set) var strips: [CGImage] = []
+    private var strips: [CGImage] = []   // own copies, so frames from the screen stream can be reused
+    private var tail: CGImage?           // the sticky bottom band of the latest frame, kept once at the end
     private(set) var totalHeight = 0
+    private var bodyHeight = 0
+    private var bottomPrev = 0           // the body ends this many rows above the bottom of the last frame
     private var last: [UInt8] = []
     private var width = 0, height = 0
 
@@ -3548,57 +3640,97 @@ final class Stitcher {
         return buf
     }
 
+    /// A copy of some rows of an image that owns its pixels.
+    static func copy(_ img: CGImage, rows: Range<Int>) -> CGImage? {
+        guard rows.count > 0, let part = img.cropping(to: CGRect(x: 0, y: rows.lowerBound, width: img.width, height: rows.count)),
+              let ctx = CGContext(data: nil, width: part.width, height: part.height, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: img.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.draw(part, in: CGRect(x: 0, y: 0, width: part.width, height: part.height))
+        return ctx.makeImage()
+    }
+
+    /// Removes rows from the end of the body.
+    private func trim(_ n: Int) {
+        var n = n
+        while n > 0, let s = strips.last, strips.count > 1 || s.height > n {
+            if s.height <= n { strips.removeLast(); bodyHeight -= s.height; n -= s.height }
+            else if let c = Self.copy(s, rows: 0..<(s.height - n)) { strips[strips.count - 1] = c; bodyHeight -= n; n = 0 }
+            else { return }
+        }
+    }
+
     enum Result { case first, added(Int), same, lost }
 
     func add(_ img: CGImage) -> Result {
         let sig = Self.signature(img)
         if strips.isEmpty || img.width != width || img.height != height {
-            strips = [img]; totalHeight = img.height; last = sig; width = img.width; height = img.height
+            width = img.width; height = img.height
+            guard let body = Self.copy(img, rows: 0..<height) else { return .same }
+            strips = [body]; tail = nil
+            bodyHeight = height; bottomPrev = 0; totalHeight = height; last = sig
             return .first
         }
+        if sig == last { return .same }
         let h = height, cols = Self.cols
+        // Leave out the edges: the overlay scroll bar appears on the right while you scroll.
+        let c0 = 2, c1 = cols - 3
+        // Rows that stay put between the two frames (a sticky header or footer, a toolbar) don't scroll.
+        func still(_ y: Int) -> Bool {
+            var t = 0
+            for c in c0..<c1 { t += abs(Int(sig[y * cols + c]) - Int(last[y * cols + c])) }
+            return t <= c1 - c0
+        }
+        var top = 0; while top < h / 3 && still(top) { top += 1 }
+        var bottom = 0; while bottom < h / 4 && still(h - 1 - bottom) { bottom += 1 }
         // How much detail each row has (blank rows score 0). Blank rows match anything, so the
         // rows with text and edges decide where the two frames overlap.
         func detail(_ g: [UInt8]) -> [Int] {
             (0..<h).map { y in
                 var t = 0
                 let r = y * cols
-                for c in 1..<cols { t += abs(Int(g[r + c]) - Int(g[r + c - 1])) }
+                for c in (c0 + 1)..<c1 { t += abs(Int(g[r + c]) - Int(g[r + c - 1])) }
                 return t
             }
         }
         let texOld = detail(last), texNew = detail(sig)
-        // Skip the top strip: a sticky header doesn't move with the page.
-        let top = h / 8
+        let maxD = min(h * 85 / 100, h - top - bottom - 16)
+        guard maxD > 0 else { return .same }
         var bestD = 0, bestScore = Double.infinity, bestWeight = 0
         sig.withUnsafeBufferPointer { new in
             last.withUnsafeBufferPointer { old in
-                for d in 0...(h * 7 / 10) {
+                for d in 0...maxD {
                     var num = 0, den = 0
                     var y = top
-                    while y < h - d {
+                    while y + d < h - bottom {   // new row y shows what old row y + d showed
                         let w = texOld[y + d] + texNew[y]
                         if w > 0 {
                             let a = y * cols, b = (y + d) * cols
                             var diff = 0
-                            for c in 0..<cols { diff += abs(Int(new[a + c]) - Int(old[b + c])) }
+                            for c in c0..<c1 { diff += abs(Int(new[a + c]) - Int(old[b + c])) }
                             num += w * diff
                             den += w
                         }
                         y += 2
                     }
                     guard den > 0 else { continue }
-                    let score = Double(num) / Double(den) / Double(cols)
+                    let score = Double(num) / Double(den) / Double(c1 - c0)
                     if score < bestScore - 0.0001 { bestScore = score; bestD = d; bestWeight = den }
                 }
             }
         }
         if bestWeight < cols * 40 { return .same }   // nothing but blank in the overlap: wait for the next frame
-        if bestScore > 3.5 { return .lost }           // scrolled too far to find the overlap
+        if bestScore > 4.5 { return .lost }           // scrolled too far to find the overlap
         if bestD == 0 { return .same }
-        guard let strip = img.cropping(to: CGRect(x: 0, y: h - bestD, width: width, height: bestD)) else { return .same }
+        // A sticky bottom band newly found: take it off the body, it goes at the very end once.
+        if bottom > bottomPrev { trim(bottom - bottomPrev); bottomPrev = bottom }
+        let start = h - bottomPrev - bestD, end = h - bottom   // the rows this frame adds
+        guard start >= 0, end > start, let strip = Self.copy(img, rows: start..<end) else { return .lost }
         strips.append(strip)
-        totalHeight += bestD
+        tail = bottom > 0 ? Self.copy(img, rows: (h - bottom)..<h) : nil
+        bodyHeight += end - start
+        bottomPrev = bottom
+        totalHeight = bodyHeight + bottom
         last = sig
         return .added(bestD)
     }
@@ -3609,7 +3741,7 @@ final class Stitcher {
                                   space: first.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
         var y = totalHeight
-        for s in strips {
+        for s in strips + (tail.map { [$0] } ?? []) {
             y -= s.height
             ctx.draw(s, in: CGRect(x: 0, y: y, width: s.width, height: s.height))
         }
@@ -3691,17 +3823,20 @@ final class OutlineView: NSView {
 }
 
 /// Scrolling capture: pick an area, scroll the page yourself, and the frames are joined
-/// into one tall screenshot. Needs the screen recording permission.
-final class ScrollCapture: NSObject {
+/// into one tall screenshot. Frames come from a live screen stream (about 30 a second),
+/// so normal scrolling keeps up. Needs the screen recording permission.
+final class ScrollCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     static var current: ScrollCapture?
     let rect: NSRect   // on screen, Cocoa coordinates
     let stitcher = Stitcher()
     var outline: NSWindow?
     var hud: NSPanel?
-    let label = NSTextField(labelWithString: "Scroll down slowly…")
-    var timer: Timer?
+    let label = NSTextField(labelWithString: "Scroll down…")
+    var stream: SCStream?
+    var timer: Timer?          // only if the stream can't start: pictures with screencapture instead
     var grabbing = false
     var finished = false
+    var lostCount = 0
     let queue = DispatchQueue(label: "claudesniper.scrollcapture")
 
     static func start() {
@@ -3718,6 +3853,8 @@ final class ScrollCapture: NSObject {
     }
 
     init(rect: NSRect) { self.rect = rect }
+
+    var screen: NSScreen { NSScreen.screens.first { $0.frame.intersects(rect) } ?? NSScreen.main! }
 
     func begin() {
         // An outline just outside the area (so it isn't in the pictures) that lets scrolling through.
@@ -3762,20 +3899,69 @@ final class ScrollCapture: NSObject {
         bg.addSubview(cancelBtn)
         p.contentView = bg
         // Below the area if there's room, otherwise above it.
-        let vf = (NSScreen.screens.first { $0.frame.intersects(rect) } ?? NSScreen.main!).visibleFrame
+        let vf = screen.visibleFrame
         var y = rect.minY - h - 14
         if y < vf.minY + 6 { y = min(rect.maxY + 14, vf.maxY - h - 6) }
         p.setFrameOrigin(NSPoint(x: min(max(rect.midX - w / 2, vf.minX + 6), vf.maxX - w - 6), y: y))
         p.orderFrontRegardless()
         hud = p
 
-        let t = Timer(timeInterval: 0.22, repeats: true) { [weak self] _ in self?.grab() }
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
+            DispatchQueue.main.async { self.startStream(content) }
+        }
+    }
+
+    // MARK: Live stream
+
+    func startStream(_ content: SCShareableContent?) {
+        guard !finished else { return }
+        let scr = screen
+        let did = (scr.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? CGMainDisplayID()
+        guard let content, let display = content.displays.first(where: { $0.displayID == did }) else { startFallback(); return }
+        let me = content.applications.filter { $0.processID == ProcessInfo.processInfo.processIdentifier }
+        let filter = SCContentFilter(display: display, excludingApplications: me, exceptingWindows: [])
+        let cfg = SCStreamConfiguration()
+        let bounds = CGDisplayBounds(did)   // global, counted from the top-left
+        let primaryH = NSScreen.screens.first?.frame.height ?? scr.frame.height
+        cfg.sourceRect = CGRect(x: rect.minX - bounds.minX, y: primaryH - rect.maxY - bounds.minY, width: rect.width, height: rect.height)
+        cfg.width = Int(rect.width * scr.backingScaleFactor)
+        cfg.height = Int(rect.height * scr.backingScaleFactor)
+        cfg.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+        cfg.pixelFormat = kCVPixelFormatType_32BGRA
+        cfg.showsCursor = false
+        cfg.queueDepth = 4
+        let s = SCStream(filter: filter, configuration: cfg, delegate: self)
+        do { try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue) } catch { startFallback(); return }
+        stream = s
+        s.startCapture { error in
+            if error != nil { DispatchQueue.main.async { self.stream = nil; self.startFallback() } }
+        }
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen, !finished, sb.isValid,
+              let info = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let raw = info.first?[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
+              let pixels = CMSampleBufferGetImageBuffer(sb) else { return }
+        var img: CGImage?
+        VTCreateCGImageFromCVPixelBuffer(pixels, options: nil, imageOut: &img)
+        if let img { show(stitcher.add(img)) }   // on `queue`, one frame at a time
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        DispatchQueue.main.async { if !self.finished { self.stream = nil; self.startFallback() } }
+    }
+
+    // MARK: Fallback: one picture at a time with screencapture
+
+    func startFallback() {
+        guard !finished, timer == nil else { return }
+        let t = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in self?.grab() }
         RunLoop.main.add(t, forMode: .common)
         timer = t
         grab()
     }
 
-    /// One picture of the area, added to the stitched image.
     func grab() {
         guard !grabbing, !finished else { return }
         grabbing = true
@@ -3789,20 +3975,25 @@ final class ScrollCapture: NSObject {
             p.arguments = ["-x", "-R", arg, "-t", "png", path]
             try? p.run()
             p.waitUntilExit()
-            var result = Stitcher.Result.same
-            if let img = NSImage(contentsOfFile: path)?.cgImage(forProposedRect: nil, context: nil, hints: nil) {
-                result = self.stitcher.add(img)
-            }
+            if let img = NSImage(contentsOfFile: path)?.cgImage(forProposedRect: nil, context: nil, hints: nil) { self.show(self.stitcher.add(img)) }
             try? FileManager.default.removeItem(atPath: path)
-            let total = self.stitcher.totalHeight
-            DispatchQueue.main.async {
-                self.grabbing = false
-                if self.finished { return }
-                let scale = (NSScreen.screens.first { $0.frame.intersects(r) } ?? NSScreen.main)?.backingScaleFactor ?? 2
-                switch result {
-                case .lost: self.label.stringValue = "Too fast: scroll back a little"; self.label.textColor = Theme.accentSoft
-                default: self.label.stringValue = "Scroll down slowly · \(Int(CGFloat(total) / scale)) pt captured"; self.label.textColor = .white
-                }
+            DispatchQueue.main.async { self.grabbing = false }
+        }
+    }
+
+    /// Updates the label after each frame (called on `queue`).
+    func show(_ result: Stitcher.Result) {
+        if case .lost = result { lostCount += 1 } else if case .same = result {} else { lostCount = 0 }
+        let lost = lostCount >= 3   // a frame or two mid-animation can miss; only say so if it keeps missing
+        let total = stitcher.totalHeight
+        DispatchQueue.main.async {
+            if self.finished { return }
+            if lost {
+                self.label.stringValue = "Lost the page: scroll back up a little"
+                self.label.textColor = Theme.accentSoft
+            } else {
+                self.label.stringValue = "Scroll down · \(Int(CGFloat(total) / self.screen.backingScaleFactor)) pt captured"
+                self.label.textColor = .white
             }
         }
     }
@@ -3810,6 +4001,8 @@ final class ScrollCapture: NSObject {
     func teardown() {
         finished = true
         timer?.invalidate()
+        stream?.stopCapture(completionHandler: nil)
+        stream = nil
         outline?.orderOut(nil)
         hud?.orderOut(nil)
         Self.current = nil
@@ -3820,12 +4013,248 @@ final class ScrollCapture: NSObject {
     @objc func finish() {
         guard !finished else { return }
         teardown()
-        queue.async {   // after any picture still being taken
+        queue.async {   // after any frame still being added
             let path = workDir + "/shot-\(Int(Date().timeIntervalSince1970)).png"
             let ok = self.stitcher.image().map { savePNG($0, to: path) } ?? false
             DispatchQueue.main.async { if ok { QuickAccess.shared.show(path) } else { Toast.show("Nothing captured") } }
         }
     }
+}
+
+/// A button that runs a closure.
+final class BarButton: NSButton {
+    var run: (() -> Void)?
+    convenience init(_ title: String, _ symbol: String, _ run: @escaping () -> Void) {
+        self.init(frame: .zero)
+        self.run = run
+        self.title = title
+        image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
+            .withSymbolConfiguration(.init(pointSize: 19, weight: .regular))
+        imagePosition = .imageAbove
+        isBordered = false
+        font = .systemFont(ofSize: 11, weight: .medium)
+        contentTintColor = .white
+        attributedTitle = NSAttributedString(string: title, attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium),
+                                                                         .foregroundColor: NSColor.white.withAlphaComponent(0.85)])
+        target = self
+        action = #selector(fire)
+        wantsLayer = true
+        layer?.cornerRadius = 9
+    }
+    @objc func fire() { run?() }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self))
+    }
+    override func mouseEntered(with e: NSEvent) { layer?.backgroundColor = NSColor.white.withAlphaComponent(0.12).cgColor }
+    override func mouseExited(with e: NSEvent) { layer?.backgroundColor = nil }
+}
+
+final class BarView: NSView {
+    var onEscape: (() -> Void)?
+    override var acceptsFirstResponder: Bool { true }
+    override func keyDown(with e: NSEvent) { if e.keyCode == UInt16(kVK_Escape) { onEscape?() } else { super.keyDown(with: e) } }
+}
+
+/// The screenshot bar (⌘⇧5 when ClaudeSniper takes over the macOS screenshot shortcuts).
+enum CaptureBar {
+    static var window: NSWindow?
+
+    static func toggle() {
+        if window != nil { close(); return }
+        let front = NSWorkspace.shared.frontmostApplication
+        let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main!
+        func pick(_ action: @escaping () -> Void) -> () -> Void {
+            return {
+                close()
+                if front?.bundleIdentifier != Bundle.main.bundleIdentifier { front?.activate() }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { action() }   // the bar is gone from the screen first
+            }
+        }
+        let groups: [[BarButton]] = [
+            [BarButton("Area", "rectangle.dashed", pick { appDelegate?.takeScreenshot() }),
+             BarButton("Window", "macwindow", pick { appDelegate?.takeWindowShot() }),
+             BarButton("Full screen", "display", pick { appDelegate?.takeFullScreenShot() }),
+             BarButton("Scrolling", "arrow.up.and.down.text.horizontal", pick { appDelegate?.scrollingCapture() })],
+            [BarButton("Copy text", "text.viewfinder", pick { appDelegate?.captureTextOnly() }),
+             BarButton("Ask Claude", "sparkles", pick { appDelegate?.captureScreen() })],
+            [BarButton("Close", "xmark", { close() })],
+        ]
+        let bw: CGFloat = 78, bh: CGFloat = 58, pad: CGFloat = 8, gap: CGFloat = 13
+        let count = CGFloat(groups.reduce(0) { $0 + $1.count })
+        let w = pad * 2 + bw * count + gap * CGFloat(groups.count - 1), h = bh + pad * 2
+        let win = KeyWindow(contentRect: NSRect(x: screen.frame.midX - w / 2, y: screen.visibleFrame.minY + 90, width: w, height: h),
+                            styleMask: .borderless, backing: .buffered, defer: false)
+        win.isOpaque = false
+        win.backgroundColor = .clear
+        win.hasShadow = true
+        win.level = .floating
+        win.isReleasedWhenClosed = false
+        win.appearance = NSAppearance(named: .darkAqua)
+        let bg = BarView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        bg.onEscape = { close() }
+        bg.wantsLayer = true
+        bg.layer?.backgroundColor = NSColor(srgbRed: 0.13, green: 0.10, blue: 0.10, alpha: 0.96).cgColor
+        bg.layer?.cornerRadius = 14
+        bg.layer?.borderWidth = 1
+        bg.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        var x = pad
+        for (i, g) in groups.enumerated() {
+            if i > 0 {
+                let line = NSView(frame: NSRect(x: x + gap / 2 - 0.5, y: pad + 10, width: 1, height: bh - 20))
+                line.wantsLayer = true
+                line.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.15).cgColor
+                bg.addSubview(line)
+                x += gap
+            }
+            for b in g {
+                b.frame = NSRect(x: x, y: pad, width: bw, height: bh)
+                bg.addSubview(b)
+                x += bw
+            }
+        }
+        groups[1][1].contentTintColor = claudeOrange
+        win.contentView = bg
+        NSApp.activate(ignoringOtherApps: true)
+        win.makeKeyAndOrderFront(nil)
+        win.makeFirstResponder(bg)
+        window = win
+    }
+
+    static func close() {
+        window?.orderOut(nil)
+        window = nil
+    }
+}
+
+/// The view of the iPhone window. macOS offers Continuity Camera (Take Photo, Scan Documents)
+/// only when the first responder of the active window accepts images, so this view does.
+final class PhoneDropView: NSView {
+    var onImage: ((String) -> Void)?
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func validRequestor(forSendType sendType: NSPasteboard.PasteboardType?, returnType: NSPasteboard.PasteboardType?) -> Any? {
+        if sendType == nil, let t = returnType, NSImage.imageTypes.contains(t.rawValue) { return self }
+        return super.validRequestor(forSendType: sendType, returnType: returnType)
+    }
+
+    /// The photo or scan from the phone arrives here.
+    @objc func readSelection(from pboard: NSPasteboard) -> Bool {
+        guard let img = NSImage(pasteboard: pboard) else { return false }
+        return deliver(img)
+    }
+
+    func deliver(_ img: NSImage) -> Bool {
+        guard let tiff = img.tiffRepresentation,
+              let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else { return false }
+        let tmp = NSTemporaryDirectory() + "claudesniper-phone-\(UUID().uuidString).png"
+        guard (try? png.write(to: URL(fileURLWithPath: tmp))) != nil else { return false }
+        DispatchQueue.main.async { self.onImage?(tmp) }
+        return true
+    }
+
+    // Dropping an image file works too.
+    override func draggingEntered(_ s: NSDraggingInfo) -> NSDragOperation {
+        s.draggingPasteboard.canReadObject(forClasses: [NSImage.self, NSURL.self], options: nil) ? .copy : []
+    }
+    override func performDragOperation(_ s: NSDraggingInfo) -> Bool {
+        if let img = NSImage(pasteboard: s.draggingPasteboard) { return deliver(img) }
+        return false
+    }
+}
+
+/// "Import from iPhone or iPad": take a photo or scan a page with the phone, then read and ask.
+final class PhoneImport: NSObject, NSWindowDelegate {
+    static let shared = PhoneImport()
+    var window: NSWindow?
+    let chooser = NSButton(title: "Take Photo or Scan…", target: nil, action: nil)
+
+    func show() {
+        if let w = window { NSApp.activate(ignoringOtherApps: true); w.makeKeyAndOrderFront(nil); return }
+        // Tell AppKit this app accepts images, or it never offers Continuity Camera.
+        NSApp.registerServicesMenuSendTypes([], returnTypes: NSImage.imageTypes.map { NSPasteboard.PasteboardType($0) })
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 272), styleMask: [.titled, .closable, .fullSizeContentView],
+                         backing: .buffered, defer: false)
+        w.title = "Import from iPhone or iPad"
+        w.titlebarAppearsTransparent = true
+        w.isReleasedWhenClosed = false
+        w.delegate = self
+        w.level = .floating
+        let v = PhoneDropView(frame: w.contentLayoutRect)
+        v.registerForDraggedTypes([.fileURL, .tiff, .png])
+        v.onImage = { [weak self] path in
+            self?.close()
+            appDelegate?.readImage(at: path, kind: .ask)
+        }
+
+        let icon = NSImageView(image: NSImage(systemSymbolName: "iphone.rear.camera", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 34, weight: .light)) ?? NSImage())
+        icon.contentTintColor = claudeOrange
+        let title = NSTextField(labelWithString: "Use your iPhone's camera")
+        title.font = .systemFont(ofSize: 15, weight: .semibold)
+        let body = NSTextField(wrappingLabelWithString: "Take a photo or scan a document with your iPhone or iPad. ClaudeSniper reads the text and asks Claude. You can also drop an image here.")
+        body.font = .systemFont(ofSize: 12)
+        body.textColor = .secondaryLabelColor
+        body.alignment = .center
+        chooser.target = self
+        chooser.action = #selector(choose)
+        chooser.bezelStyle = .rounded
+        chooser.bezelColor = claudeOrange
+        chooser.keyEquivalent = "\r"
+        let open = NSButton(title: "Open Image…", target: self, action: #selector(openFile))
+        open.bezelStyle = .rounded
+        let hint = NSTextField(wrappingLabelWithString: "Needs the iPhone near this Mac, on the same Apple Account, with Wi‑Fi and Bluetooth on.")
+        hint.font = .systemFont(ofSize: 10.5)
+        hint.textColor = .tertiaryLabelColor
+        hint.alignment = .center
+
+        let buttons = NSStackView(views: [chooser, open])
+        buttons.spacing = 10
+        let stack = NSStackView(views: [icon, title, body, buttons, hint])
+        stack.orientation = .vertical
+        stack.spacing = 10
+        stack.setCustomSpacing(16, after: body)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        v.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: v.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: v.centerYAnchor, constant: 6),
+            body.widthAnchor.constraint(equalToConstant: 330),
+            hint.widthAnchor.constraint(equalToConstant: 330),
+        ])
+        w.contentView = v
+        w.center()
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
+        w.makeFirstResponder(v)
+        window = w
+    }
+
+    /// Pops up macOS's own Continuity Camera menu (Take Photo, Scan Documents… per nearby device).
+    /// AppKit fills a context menu when the first responder accepts images.
+    @objc func choose() {
+        guard let w = window, let v = w.contentView else { return }
+        w.makeFirstResponder(v)
+        let m = NSMenu()
+        let p = chooser.convert(NSPoint(x: 0, y: chooser.bounds.height + 4), to: nil)
+        let e = NSEvent.mouseEvent(with: .rightMouseDown, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                   windowNumber: w.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+        if let e { NSMenu.popUpContextMenu(m, with: e, for: v) }
+    }
+
+    @objc func openFile() {
+        let p = NSOpenPanel()
+        p.allowedContentTypes = [.image]
+        p.beginSheetModal(for: window!) { r in
+            if r == .OK, let url = p.url, let img = NSImage(contentsOf: url),
+               let v = self.window?.contentView as? PhoneDropView { _ = v.deliver(img) }
+        }
+    }
+
+    func close() { window?.orderOut(nil); window = nil }
+    func windowWillClose(_ n: Notification) { window = nil }
 }
 
 // MARK: - Mini Clawd (a tiny floating Clawd instead of the pop-up)
